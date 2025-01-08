@@ -13,3 +13,4 @@ poetry.lock
 projects.cfg
 venv/
 .hypothesis/
+projects.d

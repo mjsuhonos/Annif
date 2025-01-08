@@ -67,6 +67,7 @@ class FastTextBackend(mixins.ChunkingBackend, backend.AnnifBackend):
     def _load_model(path: str) -> _FastText:
         # monkey patch fasttext.FastText.eprint to avoid spurious warning
         # see https://github.com/facebookresearch/fastText/issues/1067
+        fasttext.FastText.eprint = print
         orig_eprint = fasttext.FastText.eprint
         fasttext.FastText.eprint = lambda x: None
         model = fasttext.load_model(path)

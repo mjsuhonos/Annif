@@ -41,7 +41,7 @@ def test_xtransformer_default_params(project):
         "imbalanced_depth": 100,
         "max_match_clusters": 32768,
         "do_fine_tune": True,
-        "model_shortcut": "distilbert-base-multilingual-uncased",
+        "model_shortcut": "distilbert-base-uncased",
         # "model_shortcut": "bert-base-multilingual-uncased",
         "beam_size": 20,
         "limit": 100,
