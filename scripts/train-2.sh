@@ -12,11 +12,11 @@ inputdir="$1"
 # NB: these backends are resource-intensive to train
 # =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-poetry run annif train wiki-svc-en $inputdir
+#poetry run annif train wiki-svc-en $inputdir
 
 # ensemble backends
 poetry run annif train wiki-pav-en $inputdir
 poetry run annif train wiki-nn-en $inputdir
 
 # pecos / transformer
-#poetry run annif train wiki-xtransformer-en $inputdir
+poetry run annif train wiki-xtransformer-en $inputdir
