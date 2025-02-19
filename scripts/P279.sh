@@ -9,14 +9,13 @@ fi
 inputdir="$1"
 
 # =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
-# NB: these backends are resource-intensive to train
+# train lightweight backends for assessment
 # =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-#poetry run annif train wiki-svc-en $inputdir
-
-# ensemble backends
-poetry run annif train wiki-pav-en $inputdir
-poetry run annif train wiki-nn-en $inputdir
+# lexical backends
+poetry run annif train P279-tfidf-en $inputdir
+poetry run annif train P279-mllm-en $inputdir
+#poetry run annif train P279-stwfsa-en $inputdir
 
 # pecos / transformer
 poetry run annif train wiki-xtransformer-en $inputdir

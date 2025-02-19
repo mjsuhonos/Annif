@@ -21,3 +21,16 @@ poetry run annif train wiki-stwfsa-en $inputdir
 #poetry run annif train wiki-fasttext-en $inputdir
 #poetry run annif train wiki-parabel-en $inputdir
 #poetry run annif train wiki-bonsai-en $inputdir
+
+# =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+# NB: these backends are resource-intensive to train
+# =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+#poetry run annif train wiki-svc-en $inputdir
+
+# ensemble backends
+#poetry run annif train wiki-pav-en $inputdir
+#poetry run annif train wiki-nn-en $inputdir
+
+# pecos / transformer
+poetry run annif train wiki-xtransformer-en $inputdir
