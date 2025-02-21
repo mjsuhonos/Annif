@@ -19,8 +19,12 @@ poetry run annif train wiki-stwfsa-en $inputdir
 
 # associative backends
 poetry run annif train wiki-fasttext-en $inputdir
-poetry run annif train wiki-parabel-en $inputdir
-poetry run annif train wiki-bonsai-en $inputdir
+
+# only available on macos (arm) or linux (x64)
+# ie. linux aarch64 not supported
+
+#poetry run annif train wiki-parabel-en $inputdir
+#poetry run annif train wiki-bonsai-en $inputdir
 
 # =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 # NB: these backends are resource-intensive to train
