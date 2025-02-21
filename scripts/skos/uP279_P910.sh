@@ -18,4 +18,4 @@ poetry run annif train uP279_P910-mllm-en $inputdir
 #poetry run annif train uP279_P910-stwfsa-en $inputdir
 
 # pecos / transformer
-poetry run annif train wiki-xtransformer-en $inputdir
+#poetry run annif train wiki-xtransformer-en $inputdir
