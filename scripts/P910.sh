@@ -13,9 +13,9 @@ inputdir="$1"
 # =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 # lexical backends
-poetry run annif train uP279_P910_P361-tfidf-en $inputdir
-poetry run annif train uP279_P910_P361-mllm-en $inputdir
-#poetry run annif train uP279_P910_P361-stwfsa-en $inputdir
+poetry run annif train P910-tfidf-en $inputdir
+poetry run annif train P910-mllm-en $inputdir
+poetry run annif train P910-stwfsa-en $inputdir
 
 # pecos / transformer
-poetry run annif train wiki-xtransformer-en $inputdir
+poetry run annif train P910-xtransformer-en $inputdir
