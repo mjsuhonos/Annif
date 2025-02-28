@@ -41,6 +41,32 @@ inputdir="$1"
 #False negatives:              	4093
 #Documents evaluated:          	29643
 
+# RE-RUN with full vocabulary 26/6/2025
+#Precision (doc avg):          	0.0853
+#Recall (doc avg):             	0.8478
+#F1 score (doc avg):           	0.1548
+#Precision (subj avg):         	0.0250
+#Recall (subj avg):            	0.0304
+#F1 score (subj avg):          	0.0263
+#Precision (weighted subj avg):	0.6973
+#Recall (weighted subj avg):   	0.8479
+#F1 score (weighted subj avg): 	0.7343
+#Precision (microavg):         	0.0849
+#Recall (microavg):            	0.8479
+#F1 score (microavg):          	0.1544
+#F1@5:                         	0.2748
+#NDCG:                         	0.7712
+#NDCG@5:                       	0.7627
+#NDCG@10:                      	0.7712
+#Precision@1:                  	0.6895
+#Precision@3:                  	0.2656
+#Precision@5:                  	0.1650
+#True positives:               	25130
+#False positives:              	270841
+#False negatives:              	4508
+#Documents evaluated:          	29643
+
+
 #poetry run annif eval P279-stwfsa-en $inputdir
 #Precision (doc avg):          	0.0860
 #Recall (doc avg):             	0.7311
@@ -148,7 +174,6 @@ poetry run annif eval P279-ensemble-alt-en $inputdir
 #sources=P279-tfidf-en,P279-xtransformer-en
 #...
 
-
 #sources=P279-mllm-en,P279-stwfsa-en,P279-xtransformer-en
 #Precision (doc avg):          	0.0823
 #Recall (doc avg):             	0.8232
@@ -222,6 +247,31 @@ poetry run annif eval P279-ensemble-alt-en $inputdir
 #True positives:               	26102
 #False positives:              	268338
 #False negatives:              	3536
+#Documents evaluated:          	29643
+
+# RE-RUN with full vocabulary 26/6/2025
+#Precision (doc avg):          	0.0871
+#Recall (doc avg):             	0.8695
+#F1 score (doc avg):           	0.1583
+#Precision (subj avg):         	0.0256
+#Recall (subj avg):            	0.0312
+#F1 score (subj avg):          	0.0270
+#Precision (weighted subj avg):	0.7150
+#Recall (weighted subj avg):   	0.8697
+#F1 score (weighted subj avg): 	0.7533
+#Precision (microavg):         	0.0870
+#Recall (microavg):            	0.8697
+#F1 score (microavg):          	0.1582
+#F1@5:                         	0.2847
+#NDCG:                         	0.8167
+#NDCG@5:                       	0.8116
+#NDCG@10:                      	0.8167
+#Precision@1:                  	0.7571
+#Precision@3:                  	0.2790
+#Precision@5:                  	0.1709
+#True positives:               	25775
+#False positives:              	270425
+#False negatives:              	3863
 #Documents evaluated:          	29643
 
 #poetry run annif eval P279-yake-en $inputdir
