@@ -13,10 +13,10 @@ inputdir="$1"
 # =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 # lexical backends
-#poetry run annif eval P279-tfidf-en $inputdir
+poetry run annif eval P279-tfidf-en $inputdir
 # zero scores on wiki5m
 
-#poetry run annif eval P279-mllm-en $inputdir
+poetry run annif eval P279-mllm-en $inputdir
 #Precision (doc avg):          	0.0879
 #Recall (doc avg):             	0.8618
 #F1 score (doc avg):           	0.1591
@@ -67,7 +67,7 @@ inputdir="$1"
 #Documents evaluated:          	29643
 
 
-#poetry run annif eval P279-stwfsa-en $inputdir
+poetry run annif eval P279-stwfsa-en $inputdir
 #Precision (doc avg):          	0.0860
 #Recall (doc avg):             	0.7311
 #F1 score (doc avg):           	0.1506
@@ -94,6 +94,7 @@ inputdir="$1"
 
 # ensemble backends
 poetry run annif eval P279-ensemble-l-en $inputdir
+
 poetry run annif eval P279-ensemble-alt-en $inputdir
 
 # sources=P279-tfidf-en,P279-mllm-en,P279-yake-en,P279-stwfsa-en
@@ -274,7 +275,7 @@ poetry run annif eval P279-ensemble-alt-en $inputdir
 #False negatives:              	3863
 #Documents evaluated:          	29643
 
-#poetry run annif eval P279-yake-en $inputdir
+poetry run annif eval P279-yake-en $inputdir
 #Precision (doc avg):          	0.0590
 #Recall (doc avg):             	0.5599
 #F1 score (doc avg):           	0.1060
@@ -300,7 +301,7 @@ poetry run annif eval P279-ensemble-alt-en $inputdir
 #Documents evaluated:          	29643
 
 # pecos / transformer
-#poetry run annif eval P279-xtransformer-en $inputdir
+poetry run annif eval P279-xtransformer-en $inputdir
 # zero scores on wiki5m
 
 #poetry run annif eval P279-pav-en $inputdir
