@@ -85,6 +85,7 @@ dev = [
     "black==25.*",
     "isort",
     "schemathesis~=4.27.2",
+    "laya~=0.3.22",
 ]
 all = ["annif[fasttext,estnltk,nn,omikuji,spacy,stwfsa,voikko,yake]"]
 
