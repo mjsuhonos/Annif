@@ -36,6 +36,12 @@ def _http() -> Type[AnnifBackend]:
     return http.HTTPBackend
 
 
+def _laya() -> Type[AnnifBackend]:
+    from . import laya
+
+    return laya.LayaBackend
+
+
 def _mllm() -> Type[AnnifBackend]:
     from . import mllm
 
@@ -102,6 +108,7 @@ _backend_fns = {
     "ensemble": _ensemble,
     "fasttext": _fasttext,
     "http": _http,
+    "laya": _laya,
     "mllm": _mllm,
     "nn_ensemble": _nn_ensemble,
     "omikuji": _omikuji,
