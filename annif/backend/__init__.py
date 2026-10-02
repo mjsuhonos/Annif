@@ -41,6 +41,13 @@ def _laya() -> Type[AnnifBackend]:
 
     return laya.LayaBackend
 
+    try:
+        from . import laya
+
+        return laya.LayaBackend
+    except ImportError:
+        raise ValueError("Laya not available, cannot use laya backend")
+
 
 def _mllm() -> Type[AnnifBackend]:
     from . import mllm
