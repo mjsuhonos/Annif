@@ -64,6 +64,7 @@ spacy = [
 stwfsa = ["stwfsapy~=0.6.1"]
 voikko = ["voikko==0.5.*"]
 yake = ["yake~=0.7.3"]
+laya = ["laya"]
 
 [project.urls]
 homepage = "https://annif.org"
@@ -85,7 +86,7 @@ dev = [
     "black==25.*",
     "isort",
     "schemathesis~=4.27.2",
-    "laya~=0.3.22",
+    "laya~=0.3.20",
 ]
 all = ["annif[fasttext,estnltk,nn,omikuji,spacy,stwfsa,voikko,yake]"]
 
