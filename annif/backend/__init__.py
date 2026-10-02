@@ -37,10 +37,6 @@ def _http() -> Type[AnnifBackend]:
 
 
 def _laya() -> Type[AnnifBackend]:
-    from . import laya
-
-    return laya.LayaBackend
-
     try:
         from . import laya
 
