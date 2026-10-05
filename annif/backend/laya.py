@@ -4,13 +4,16 @@ convaiinnovations/laya, PyPI package ``laya``).
 
 Like the plain ensemble backend it merges the suggestions of the
 configured source projects, but instead of returning the merged scores
-as-is, it asks Laya one "choice" question per document ("Which subject
-does this text reference?") with the candidate subjects as options, and
-blends each option probability with the candidate's source score. The
+as-is, it asks Laya about the candidate subjects (one choice question
+per document, one yes/no proposition per candidate, or both, depending
+on the laya_score_mode parameter) and blends the answers with the
+source scores. The blend follows the CLM backend: both score sets are
+min-max normalized per document (the blend-source parameter can keep
+the source scores raw) and a missing Laya score counts as 0.0. The
 pipeline is zero-shot: no model is ever trained.
 
-Parameter documentation, measured results and the tuning workflow
-(``annif optimize`` / ``annif hyperopt``) live in docs/laya.md.
+Parameter documentation and the tuning workflow
+(``annif hyperopt``) live in docs/laya.md.
 Requires the ``laya`` Python package; the checkpoint is downloaded
 from Hugging Face on first use.
 """
@@ -22,7 +25,11 @@ from typing import TYPE_CHECKING, Any
 
 import annif.eval
 import annif.util
-from annif.exception import NotSupportedException, OperationFailedException
+from annif.exception import (
+    ConfigurationException,
+    NotSupportedException,
+    OperationFailedException,
+)
 from annif.suggestion import SuggestionBatch, SubjectSuggestion
 
 from . import hyperopt
@@ -38,40 +45,144 @@ if TYPE_CHECKING:
     from annif.vocab.types import Subject
 
 
+def _parse_score_mode(mode: str) -> frozenset[str]:
+    """Parse the laya_score_mode parameter into the set of answer kinds
+    it names: "choice", "noul", or both ("choice,noul" and "noul,choice"
+    are equivalent)."""
+    kinds = frozenset(kind.strip() for kind in mode.lower().split(","))
+    if not kinds <= {"choice", "noul"}:
+        raise ConfigurationException(
+            "laya_score_mode must be 'choice', 'noul' or a combination "
+            "of both, got '{}'".format(mode)
+        )
+    return kinds
+
+
+def _parse_blend_source(blend_source: str) -> str:
+    """Validate the blend-source parameter: "normalized" (the
+    CLM-style default) or "raw"."""
+    if blend_source not in ("normalized", "raw"):
+        raise ConfigurationException(
+            "blend-source must be 'normalized' or 'raw', "
+            "got '{}'".format(blend_source)
+        )
+    return blend_source
+
+
+def _blend(
+    suggestions: list[SubjectSuggestion],
+    laya_scores: dict[str, dict[int, float | None]],
+    kinds: frozenset[str],
+    alpha: float,
+    blend_source: str = "normalized",
+    debug=None,
+) -> list[SubjectSuggestion]:
+    """Blend the source and Laya scores of one document, keeping all
+    candidates. The Laya scores are min-max normalized per document (a
+    degenerate set maps to 0.5), and the new score is
+    alpha * source + (1 - alpha) * laya_norm, where the source scores
+    are either min-max normalized per document like the Laya scores
+    ("normalized", the CLM-style default) or used as-is ("raw"),
+    keeping their absolute confidence.
+
+    The Laya value of a candidate is the answer of the single requested
+    kind, or the average of the available answers when both kinds are
+    requested; a candidate with no answer at all counts as 0.0, and the
+    misses are reported through the given debug logger, if any."""
+
+    def norm(value: float, lo: float, hi: float) -> float:
+        if hi == lo:
+            return 0.5
+        return (value - lo) / (hi - lo)
+
+    values = []
+    missing = []
+    for suggestion in suggestions:
+        answers = [
+            laya_scores[kind][suggestion.subject_id]
+            for kind in sorted(kinds)
+            if laya_scores.get(kind, {}).get(suggestion.subject_id) is not None
+        ]
+        if answers:
+            values.append(sum(answers) / len(answers))
+        else:
+            # a candidate without any Laya answer counts as 0.0
+            values.append(0.0)
+            missing.append(suggestion.subject_id)
+    if missing and debug is not None:
+        debug(
+            "missing Laya score for subject(s) {}, counting as 0.0".format(
+                ", ".join(str(subject_id) for subject_id in missing)
+            )
+        )
+
+    if blend_source == "raw":
+        source_values = [suggestion.score for suggestion in suggestions]
+    else:
+        src_min = min(suggestion.score for suggestion in suggestions)
+        src_max = max(suggestion.score for suggestion in suggestions)
+        source_values = [
+            norm(suggestion.score, src_min, src_max) for suggestion in suggestions
+        ]
+    lo, hi = min(values), max(values)
+
+    blended = [
+        SubjectSuggestion(
+            subject_id=suggestion.subject_id,
+            score=alpha * source_value + (1.0 - alpha) * norm(laya_value, lo, hi),
+        )
+        for suggestion, source_value, laya_value in zip(
+            suggestions, source_values, values
+        )
+    ]
+    # the blend can change the ranking, so sort explicitly
+    blended.sort(key=lambda suggestion: suggestion.score, reverse=True)
+    return blended
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a rough remaining duration for progress logging."""
+    if seconds >= 60:
+        return "~{:.0f} min".format(seconds / 60)
+    return "~{:.0f}s".format(seconds)
+
+
 class LayaHPObjective(hyperopt.HPObjective):
     """Objective of the laya hyperparameter optimizer: samples
-    laya_weight values and re-combines the Laya answers cached by
-    _prepare() exactly like the backend does at suggest time - at the
-    configured limit and threshold - so trials need no model
-    inference."""
+    blend-alpha and blend-source - and laya_score_mode, when the cached
+    answers cover more than one mode - and re-scores the Laya answers
+    cached by _prepare() exactly like the backend does at suggest time
+    - at the configured limit - so trials need no model inference."""
 
     @classmethod
     def objective(cls, trial: Trial, args) -> float:
-        laya_weight = trial.suggest_float("laya_weight", 0.0, 1.0)
+        alpha = trial.suggest_float("blend-alpha", 0.0, 1.0)
+        blend_source = trial.suggest_categorical("blend-source", ["normalized", "raw"])
+        modes = args["modes"]
+        if len(modes) > 1:
+            mode = trial.suggest_categorical("laya_score_mode", modes)
+            kinds = _parse_score_mode(mode)
+        else:
+            kinds = _parse_score_mode(modes[0])
         limit = args["limit"]
-        threshold = args["threshold"]
 
         eval_batch = annif.eval.EvaluationBatch(args["subject_index"])
         for verified, gold_batch in zip(args["verified_batches"], args["gold_batches"]):
             rescored_results = []
-            for pairs, _status in verified:
-                suggestions = []
-                for suggestion, probability in pairs:
-                    if probability is None:
-                        score = suggestion.score
-                    else:
-                        score = (
-                            laya_weight * probability
-                            + (1.0 - laya_weight) * suggestion.score
-                        )
-                    suggestions.append(
-                        SubjectSuggestion(subject_id=suggestion.subject_id, score=score)
+            for suggestions, laya_scores, status in verified:
+                if status == "empty":
+                    rescored_results.append([])
+                elif status == "failed":
+                    # no usable answer: keep the source scores
+                    rescored_results.append(list(suggestions))
+                else:
+                    rescored_results.append(
+                        _blend(suggestions, laya_scores, kinds, alpha, blend_source)
                     )
-                rescored_results.append(suggestions)
             batch = SuggestionBatch.from_sequence(
                 rescored_results, args["subject_index"]
             )
-            batch = batch.filter(limit=limit, threshold=threshold)
+            batch = batch.filter(limit=limit)
             eval_batch.evaluate_many(batch, gold_batch)
 
         return eval_batch.results(metrics=[args["metric"]])[args["metric"]]
@@ -79,14 +190,12 @@ class LayaHPObjective(hyperopt.HPObjective):
 
 class LayaOptimizer(hyperopt.HyperparameterOptimizer):
     """Hyperparameter optimizer for the laya backend: selects
-    laya_weight for a labeled corpus, at the limit and threshold
-    configured in the project. _prepare() runs the source merge and the
-    Laya questions once; the trials re-combine the cached answers, so
-    any number of trials costs one inference pass over the corpus.
-    Tune the threshold with "annif optimize" instead (its grid handles
-    the threshold's cliff-shaped landscape); after this optimizer moves
-    the weight, re-run optimize to re-tune the threshold at the new
-    score distribution."""
+    blend-alpha and blend-source - and laya_score_mode, when the
+    configured mode is "choice,noul" - for a labeled corpus, at the
+    limit configured in the project. _prepare() runs the source merge
+    and asks Laya the question kinds of the configured mode once; the
+    trials re-score the cached answers, so any number of trials costs
+    one inference pass over the corpus."""
 
     def __init__(
         self,
@@ -98,59 +207,125 @@ class LayaOptimizer(hyperopt.HyperparameterOptimizer):
 
     def _prepare(self, n_jobs: int = 1) -> dict[str, Any]:
         # n_jobs is unused: preparation is bound by the single Laya
-        # forward pass per document, not by CPU parallelism
+        # request per document, not by CPU parallelism
         self._backend.initialize()
         params = self._backend._get_backend_params(None)
         sources = annif.util.parse_sources(params["sources"])
 
+        # ask the question kinds of the configured mode; the trials can
+        # compare only the modes whose kinds are within them, so the
+        # cross-mode comparison is bought by configuring "choice,noul"
+        kinds = _parse_score_mode(params.get("laya_score_mode", "choice"))
+        modes = [
+            mode
+            for mode in ("choice", "noul", "choice,noul")
+            if _parse_score_mode(mode) <= kinds
+        ]
+
+        # count the documents first (corpora are re-iterable, like in
+        # DocumentCorpus.is_empty) so that the caching pass can report
+        # progress
+        total_docs = sum(1 for _ in self._corpus.documents)
+        self._backend.info(
+            "Laya: caching answers for {} doc(s) ({})".format(
+                total_docs, " + ".join(sorted(kinds))
+            )
+        )
+
         verified_batches = []
         gold_batches = []
+        docs_done = 0
+        questions = 0
+        started = time.monotonic()
         for doc_batch in self._corpus.doc_batches:
             docs = list(doc_batch)
             batch_by_source = self._backend._suggest_with_sources(docs, sources)
             merged = self._backend._merge_source_batches(
                 batch_by_source, sources, params
             )
-            verified_batches.append(self._backend._verify_batch(docs, merged, params))
+            verified = self._backend._verify_batch(docs, merged, params)
+            verified_batches.append(verified)
             gold_batches.append([doc.subject_set for doc in docs])
+
+            docs_done += len(docs)
+            questions += sum(
+                (1 if "choice" in kinds else 0)
+                + (len(suggestions) if "noul" in kinds else 0)
+                for suggestions, _laya_scores, status in verified
+                if status != "empty"
+            )
+            elapsed = time.monotonic() - started
+            progress = (
+                "Laya: cached {}/{} doc(s) ({:.1f}%), {} question(s), "
+                "{:.1f}s".format(
+                    docs_done,
+                    total_docs,
+                    100.0 * docs_done / total_docs,
+                    questions,
+                    elapsed,
+                )
+            )
+            if docs_done < total_docs:
+                remaining = (total_docs - docs_done) * elapsed / docs_done
+                progress += ", {} left".format(_format_duration(remaining))
+            self._backend.info(progress)
 
         return {
             "verified_batches": verified_batches,
             "gold_batches": gold_batches,
             "subject_index": self._backend.project.subjects,
             "limit": int(params["limit"]),
-            "threshold": float(params.get("threshold") or 0.0),
             "metric": self._metric,
+            "modes": modes,
         }
 
     def _postprocess(self, study: Study) -> hyperopt.HPRecommendation:
-        return hyperopt.HPRecommendation(
-            lines=["laya_weight = {:.4f}".format(study.best_params["laya_weight"])],
-            score=study.best_value,
-        )
+        lines = [
+            "blend-alpha = {:.4f}".format(study.best_params["blend-alpha"]),
+            "blend-source = {}".format(study.best_params["blend-source"]),
+        ]
+        if "laya_score_mode" in study.best_params:
+            lines.append(
+                "laya_score_mode = {}".format(study.best_params["laya_score_mode"])
+            )
+        return hyperopt.HPRecommendation(lines=lines, score=study.best_value)
 
 
 class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
-    """Ensemble backend that re-scores merged suggestions with Laya by
-    asking one choice question whose options are the suggested
-    subjects."""
+    """Ensemble backend that re-scores merged suggestions with Laya:
+    one choice question over the candidates, one yes/no proposition per
+    candidate, or both - blended CLM-style, with the source scores
+    min-max normalized per document or used raw."""
 
     name = "laya"
 
-    # See docs/laya.md for parameter documentation and measurements.
+    # See docs/laya.md for parameter documentation.
     DEFAULT_PARAMETERS = {
-        # option pool for the choice question (and cap on suggestions)
+        # candidate pool: the top-limit merged candidates are compared
+        # (and the cap on returned suggestions)
         "limit": 20,
         # instruction of the choice question
-        "question_template": "Which subject does this text reference?",
-        # blend weight: score = w * option_probability + (1 - w) * source
-        "laya_weight": 0.25,
-        # minimum returned score, applied inside the backend
-        "threshold": 0.0,
-        # checkpoint; set to an empty value to let Laya route by language
-        "laya_model": "multilingual",
+        "question_template": "Which subject does this document reference?",
+        # proposition of the noul questions; {label} is required
+        "instruction": "This document is about {label}.",
+        # scoring mode: which questions Laya is asked and which answers
+        # score the candidates - "choice", "noul", or "choice,noul"
+        # for both
+        "laya_score_mode": "choice",
+        # blend weight: score = alpha * source
+        # + (1 - alpha) * norm(laya)
+        "blend-alpha": 0.85,
+        # how the source scores enter the blend: min-max normalized
+        # per document ("normalized", the CLM-style default) or as-is
+        # ("raw", keeping their absolute confidence)
+        "blend-source": "normalized",
+        # checkpoint; default to an empty value to let Laya route by language
+        "laya_model": "",
         # cap on the raw text sent to Laya (tokenizer savings)
         "laya_input_chars": 0,
+        # optional Laya token budgets
+        "laya_max_len": 0,
+        "laya_head_max_len": 0,
     }
 
     # class-level default so uninitialized instances behave like other
@@ -193,39 +368,24 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
             kwargs["head_max_len"] = int(params["laya_head_max_len"])
         return kwargs
 
-    def _verify_batch(
+    def _build_questions(
         self,
-        documents: list[Document],
-        merged: SuggestionBatch,
+        suggestions: list[SubjectSuggestion],
         params: dict[str, Any],
-    ) -> list[tuple[list[tuple[SubjectSuggestion, float | None]], str]]:
-        """Ask Laya to verify the merged candidates: one choice question
-        per document, options = candidate labels.
+        kinds: frozenset[str],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, SubjectSuggestion]]:
+        """Build the Laya questions of one document, all asked together
+        in a single request: a choice question over the candidate labels
+        ("choice"), one yes/no proposition per candidate ("noul"), or
+        both. Returns the questions and a mapping of choice option text
+        to suggestion (empty when no choice question is asked)."""
 
-        Returns one (pairs, status) entry per document, where pairs are
-        (suggestion, probability_or_None) in source-ranking order and
-        status is "ok", "failed", "no_probabilities" or "empty".
-        Candidates with probability None keep their source score. This
-        is the expensive half of the backend (one Laya forward pass per
-        document); the hyperparameter optimizer reuses it to cache the
-        answers once for all its trials."""
+        questions = {}
+        option_text = {}
 
-        default_template = self.DEFAULT_PARAMETERS["question_template"]
-        instructions = params.get("question_template", default_template)
-        input_chars = int(params.get("laya_input_chars", 0))
-        predict_kwargs = self._predict_kwargs(params)
-
-        verified = []
-        for doc, result in zip(documents, merged):
-            suggestions = list(result)
-
-            if not suggestions:
-                verified.append(([], "empty"))
-                continue
-
+        if "choice" in kinds:
             # option texts must be unique: duplicate labels get a
             # counter suffix (Laya answers are keyed by these texts)
-            option_text = {}
             for suggestion in suggestions:
                 subject = self.project.subjects[suggestion.subject_id]
                 base = self._subject_label(subject)
@@ -235,54 +395,117 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
                     label = "{} ({})".format(base, n)
                 option_text[label] = suggestion
 
-            questions = {
-                "the_subject": {
-                    "type": "choice",
-                    "instructions": instructions,
-                    "criteria": {label: "" for label in option_text},
-                }
+            questions["the_subject"] = {
+                "type": "choice",
+                "instructions": params.get(
+                    "question_template", self.DEFAULT_PARAMETERS["question_template"]
+                ),
+                "criteria": {label: "" for label in option_text},
             }
 
+        if "noul" in kinds:
+            instruction = params.get(
+                "instruction", self.DEFAULT_PARAMETERS["instruction"]
+            )
+            if "{label}" not in instruction:
+                raise ConfigurationException(
+                    "instruction parameter must contain a {label} placeholder"
+                )
+            for suggestion in suggestions:
+                subject = self.project.subjects[suggestion.subject_id]
+                label = self._subject_label(subject)
+                questions[str(suggestion.subject_id)] = {
+                    "type": "noul",
+                    "instructions": instruction.format(label=label),
+                }
+
+        return questions, option_text
+
+    def _verify_batch(
+        self,
+        documents: list[Document],
+        merged: SuggestionBatch,
+        params: dict[str, Any],
+    ) -> list[tuple[list[SubjectSuggestion], dict[str, dict[int, float | None]], str]]:
+        """Ask Laya to verify the merged candidates of each document in
+        a single request, asking the questions of the configured
+        laya_score_mode.
+
+        Returns one (suggestions, laya_scores, status) entry per
+        document. laya_scores holds, per asked kind, a
+        subject_id -> score mapping where an unanswered question is
+        None (counted as 0.0 at scoring time). status is "ok",
+        "failed" or "empty". This is the expensive half of the backend
+        (one Laya request per document); the hyperparameter optimizer
+        reuses it to cache the answers once for all its trials, so
+        every scoring experiment runs on the cached answers."""
+
+        kinds = _parse_score_mode(params.get("laya_score_mode", "choice"))
+        input_chars = int(params.get("laya_input_chars", 0))
+
+        verified = []
+        for doc_idx, (doc, result) in enumerate(zip(documents, merged), 1):
+            suggestions = list(result)
+            if not suggestions:
+                verified.append(([], {}, "empty"))
+                continue
+
+            questions, option_text = self._build_questions(suggestions, params, kinds)
+
             # laya_input_chars: the sources always see the full text,
-            # only the question may use the truncated text
+            # only the questions may use the truncated text
             text = doc.text[:input_chars] if input_chars > 0 else doc.text
 
             self.debug(
-                "asking Laya a choice question with {} option(s) for a "
-                "document of {} characters".format(len(option_text), len(doc.text))
+                "asking Laya {} question(s) ({} choice + {} noul) for "
+                "document {}/{} of {} characters".format(
+                    len(questions),
+                    1 if "choice" in kinds else 0,
+                    len(suggestions) if "noul" in kinds else 0,
+                    doc_idx,
+                    len(documents),
+                    len(doc.text),
+                )
             )
 
             try:
-                answer = self._router.predict(text, questions, **predict_kwargs)
-                value = answer["answers"]["the_subject"]
+                answer = self._router.predict(
+                    text, questions, **self._predict_kwargs(params)
+                )
             except Exception as err:
                 # keep the plain ensemble scores rather than failing the
                 # whole suggestion batch
                 self.warning(
                     "Laya prediction failed, keeping original scores: {}".format(err)
                 )
-                verified.append(([(s, None) for s in suggestions], "failed"))
+                verified.append((suggestions, {}, "failed"))
                 continue
 
-            probabilities = value.get("probabilities")
-            if not probabilities:
-                self.debug(
-                    "  no probabilities in answer, keeping {} original "
-                    "score(s)".format(len(suggestions))
+            answers = answer.get("answers", {})
+            laya_scores = {}
+
+            if "choice" in kinds:
+                probabilities = (
+                    answers.get("the_subject", {}).get("probabilities") or {}
                 )
-                verified.append(([(s, None) for s in suggestions], "no_probabilities"))
-                continue
-
-            pairs = []
-            for label, suggestion in option_text.items():
-                probability = probabilities.get(label)
-                pairs.append(
-                    (
-                        suggestion,
-                        float(probability) if probability is not None else None,
+                choice_scores = {}
+                for label, suggestion in option_text.items():
+                    probability = probabilities.get(label)
+                    choice_scores[suggestion.subject_id] = (
+                        float(probability) if probability is not None else None
                     )
-                )
-            verified.append((pairs, "ok"))
+                laya_scores["choice"] = choice_scores
+
+            if "noul" in kinds:
+                noul_scores = {}
+                for suggestion in suggestions:
+                    value = answers.get(str(suggestion.subject_id), {}).get("noul")
+                    noul_scores[suggestion.subject_id] = (
+                        float(value) if value is not None else None
+                    )
+                laya_scores["noul"] = noul_scores
+
+            verified.append((suggestions, laya_scores, "ok"))
 
         return verified
 
@@ -292,45 +515,43 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         merged: SuggestionBatch,
         params: dict[str, Any],
     ) -> SuggestionBatch:
-        """Blend the Laya option probabilities (from _verify_batch) with
-        the source scores, then apply the output limit and threshold."""
+        """Blend the cached Laya scores (from _verify_batch) with the
+        source scores, then apply the output limit."""
 
-        laya_weight = float(
-            params.get("laya_weight", self.DEFAULT_PARAMETERS["laya_weight"])
+        alpha = float(params.get("blend-alpha", self.DEFAULT_PARAMETERS["blend-alpha"]))
+        blend_source = _parse_blend_source(
+            params.get("blend-source", self.DEFAULT_PARAMETERS["blend-source"])
         )
-        threshold = float(params.get("threshold") or 0.0)
+        kinds = _parse_score_mode(params.get("laya_score_mode", "choice"))
+
         started = time.monotonic()
 
         verified = self._verify_batch(documents, merged, params)
 
         rescored_results = []
         candidates = 0
-        for pairs, status in verified:
+        for suggestions, laya_scores, status in verified:
             if status == "empty":
                 rescored_results.append([])
                 continue
 
-            candidates += len(pairs)
+            candidates += len(suggestions)
 
-            if status in ("failed", "no_probabilities"):
+            if status == "failed":
                 # no usable answer: keep the source scores
-                rescored_results.append([suggestion for suggestion, _ in pairs])
+                rescored_results.append(list(suggestions))
                 continue
 
-            new_suggestions = []
-            for suggestion, probability in pairs:
-                if probability is None:
-                    # option missing from the answer: keep the source score
-                    new_suggestions.append(suggestion)
-                else:
-                    score = (
-                        laya_weight * probability
-                        + (1.0 - laya_weight) * suggestion.score
-                    )
-                    new_suggestions.append(
-                        SubjectSuggestion(subject_id=suggestion.subject_id, score=score)
-                    )
-            rescored_results.append(new_suggestions)
+            rescored_results.append(
+                _blend(
+                    suggestions,
+                    laya_scores,
+                    kinds,
+                    alpha,
+                    blend_source,
+                    debug=self.debug,
+                )
+            )
 
         self.info(
             "Laya: {} doc(s), {} candidate(s), {:.2f}s".format(
@@ -342,7 +563,7 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         # top-limit candidates by blended score, not by the source
         # ranking they arrived in
         batch = SuggestionBatch.from_sequence(rescored_results, self.project.subjects)
-        return batch.filter(limit=int(params["limit"]), threshold=threshold)
+        return batch.filter(limit=int(params["limit"]))
 
     def _suggest_batch(
         self, documents: list[Document], params: dict[str, Any]
@@ -375,5 +596,6 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
 
     def get_hp_optimizer(self, corpus: DocumentCorpus, metric: str) -> LayaOptimizer:
         """Get a hyperparameter optimizer that selects the best
-        laya_weight for the given corpus at the configured threshold."""
+        blend-alpha and blend-source - and laya_score_mode, when the
+        configured mode allows comparing modes - for the given corpus."""
         return LayaOptimizer(self, corpus, metric)

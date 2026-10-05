@@ -8,92 +8,173 @@ calibrated probabilities in a single forward pass, without generating
 any text.
 
 This is the single documentation home for the backend: parameter
-guidance, measured results, and the tuning workflow.
+guidance and the tuning workflow. Measurements in this document come
+from tuning a YAKE-sourced development corpus and are in-sample;
+re-measure on your own corpus before relying on any figure.
 
 ## How it works
 
-For each document the backend asks Laya **one choice question** —
-*"Which subject does this text reference?"* — whose options are the
-candidate subjects suggested by the configured source projects. Laya
-compares the candidates against each other and returns a probability
-for every option; each probability is blended with the candidate's
-original source score to produce its final score.
+For each document the backend sends Laya **one request** whose
+questions are chosen by `laya_score_mode`:
+
+- `choice` — a single **choice question** (*"Which subject does this
+  text reference?"*) whose options are the candidate labels. Laya
+  compares the candidates against each other and returns a probability
+  for every option.
+- `noul` — one **yes/no proposition** per candidate (*"This document is
+  about {label}."*), each scored independently.
+- `choice,noul` (equivalently `noul,choice`) — both of the above in the
+  same request.
+
+The scoring stage then blends the selected answers with the source
+scores following the CLM backend's model:
 
 ```
 sources ──> weighted merge (top-`limit` candidates)
               │
               ▼
-       one Laya choice question per document
-       (options = candidate labels)
+       one Laya request per document
+       (questions per `laya_score_mode`)
               │
               ▼
-       score = laya_weight · P(option)
-             + (1 - laya_weight) · source score
+       per-document min-max normalization of the Laya
+       scores (and of the source scores, unless
+       blend-source = raw)
               │
               ▼
-       drop candidates below `threshold`, return
+       score = blend-alpha · source
+             + (1 − blend-alpha) · norm(laya)
+              │
+              ▼
+       keep the top-`limit` candidates, return
 ```
 
-Fallbacks: if the prediction fails or the answer carries no
-probabilities (for example when the options overflow the question token
-budget), every candidate of that document keeps its original source
-score. The models are never trained — the pipeline is fully zero-shot.
+The questions asked — at suggest time and during `annif hyperopt` —
+are those of the configured mode. A `choice,noul` configuration makes
+the hyperopt caching pass answer both question kinds, so its trials
+compare all three modes without new inference; a single-mode
+configuration makes the pass much cheaper (with `choice`, back to one
+question per document) and the trials tune `blend-alpha` at that
+mode.
+
+### Scoring rules
+
+- Min-max normalization is per document and per score set, and always
+  applies to the Laya scores. With the default `blend-source =
+  normalized` it applies to the source scores too, so a document with
+  a single candidate — where both sets are degenerate — always scores
+  0.5. With `blend-source = raw` the source score keeps its absolute
+  value, so a one-candidate document scores
+  `blend-alpha × source + (1 − blend-alpha) × 0.5`.
+- In the combined mode the Laya value of a candidate is the **average
+  of the answers that exist**: if one answer set is entirely missing,
+  scoring falls back to the other signal; per-candidate, a single
+  available answer is used as-is.
+- A candidate with no answer at all counts as 0.0 — *not* as its
+  source score. The weakest candidate of a document can therefore
+  blend to exactly 0.0 and be dropped from the results. Misses are
+  visible in DEBUG output: `missing Laya score for subject(s) …,
+  counting as 0.0`.
+- If the whole Laya request fails, every candidate of that document
+  keeps its original source score instead. This fallback is
+  deliberately different from a per-candidate miss, which counts as
+  0.0.
+- The blend can reorder candidates; the output is re-sorted by blended
+  score, and the output `limit` keeps the top candidates by blended
+  score, not by the source ranking they arrived in.
+
+The models are never trained — the pipeline is fully zero-shot.
 
 ## Parameters
 
 | parameter | meaning | default |
 |---|---|---|
 | `sources` | source projects, as in the plain ensemble | required |
-| `limit` | option pool: how many merged candidates the choice question compares (and the cap on returned suggestions) | 20 |
-| `laya_weight` | weight of Laya's option probability in the final score | 0.25 |
-| `threshold` | minimum score of returned suggestions, applied inside the backend | 0.0 (YAKE sources: 0.75 — see "The YAKE profile") |
-| `question_template` | the choice question's instruction text | "Which subject does this text reference?" |
+| `limit` | candidate pool: how many merged candidates are compared (and the cap on returned suggestions) | 20 |
+| `laya_score_mode` | which questions Laya is asked and which answers score the candidates: `choice`, `noul`, or `choice,noul` | `choice` |
+| `blend-alpha` | weight of the source score in the blend (normalized or raw per `blend-source`) | 0.85 |
+| `blend-source` | how the source scores enter the blend: min-max normalized per document (`normalized`) or as-is (`raw`) | `normalized` |
+| `question_template` | the choice question's instruction text | "Which subject does this document reference?" |
+| `instruction` | the per-candidate proposition text; `{label}` is required | "This document is about {label}." |
 | `laya_model` | checkpoint | `multilingual` (empty value restores language-based auto-routing) |
 | `laya_max_len` / `laya_head_max_len` | token budgets (see below) | the checkpoint's own values |
 | `laya_input_chars` | cap on the raw text sent to Laya (tokenizer savings) | 0 = full text |
 
-### `limit` — the option pool
+### `limit` — the candidate pool
 
 Keep it at or below ~20: Laya's own documentation warns that choice
-accuracy degrades as the options outgrow the question token budget.
-Keep it well above 2: measured on a 5,664-document corpus, a pool of
-only the top-2 candidates caps gold recovery at 0.496, versus 0.799 at
-depth 20 — the ceiling collapses before Laya even gets to rank. The
-returned set size in practice is governed by `threshold`; callers can
-cap it further per request (`-l` on the CLI, `limit` in the REST API),
-as elsewhere in Annif.
+accuracy degrades as the options outgrow the question token budget,
+and in the modes that use propositions every candidate adds one to the
+request, so very large pools inflate the question text. Keep it well
+above 2: measured on a development corpus, a pool of only the top-2
+candidates capped gold recovery at 0.50, versus 0.80 at depth 20 —
+the ceiling collapses before Laya even gets to rank (this figure
+measures the source candidate pool, not the scoring). The returned set
+is the top-`limit` candidates by blended score; callers can shrink it
+per request (`-t` on the CLI, `threshold` in the REST API), which
+filters the same blended scores from outside the backend, as elsewhere
+in Annif.
 
-### `laya_weight` — the blend
+### `blend-alpha` and `laya_score_mode` — the blend
 
 ```
-final score = laya_weight × P(option) + (1 − laya_weight) × source score
+final score = blend-alpha × source + (1 − blend-alpha) × norm(laya)
 ```
 
-`laya_weight = 1.0` is pure replacement (the source ranking is
-discarded); blending lets one weak signal be rescued by the other.
-The 0.25 default is measured: it beat 0.5, 0.75 and 1.0 at every
-candidate-pool depth on a weak source, and for already-strong sources
-(where blending only hurts) it deviates least from the source ranking.
+`blend-source` picks how the source scores enter the blend:
+`normalized` (the default, CLM-style) min-max normalizes them per
+document like the Laya scores, so the blend weighs two *relative*
+rankings; `raw` uses them as-is, keeping their absolute confidence.
+The raw variant matters when the source's score scale itself carries
+signal — for example YAKE, whose top keyword of nearly any document
+lands near saliency 1.0, so an absolute threshold on the blend can mean
+"the extractor is confident, unless the verifier contradicts it";
+per-document normalization discards exactly that.
 
-### `threshold` — output sizing
+`blend-alpha = 1.0` keeps the source ranking (normalized or raw
+according to `blend-source`). `blend-alpha = 0.0` is pure replacement:
+the output ranking is the normalized Laya ranking of the selected
+mode, and the weakest Laya candidate scores 0.0. The 0.85 default is
+CLM's: trust the source as the primary ranker and let the zero-shot
+verifier adjust about 15%. Tune it per project with `annif hyperopt`,
+which also tunes `blend-source` — but note that hyperopt optimizes an
+unthresholded metric; the best *thresholded* operating point can
+prefer a very different pair (see the tuning workflow).
 
-Applied to the final blended scores *inside* the backend, so every
-caller — `annif eval`, `annif suggest`, the REST API — honors it; CLI
-`-t` flags apply on top of it. Tune it with `annif optimize` (remove it
-from the config first so the sweep sees the full score range), then set
-it in the config before running `annif hyperopt`, which tunes the
-weight at the configured threshold.
+`laya_score_mode` selects both the questions and the answers used for
+scoring: `choice` compares the candidates against each other in one
+question; `noul` scores each candidate independently; `choice,noul`
+asks both and averages the available answers per candidate.
 
-A threshold is only meaningful **paired with its weight**: the score
-distribution depends on `laya_weight`. Never copy a threshold across
-different weights. Thresholds can also sit on a cliff — measured
-example: F1@5 jumps from 0.44 to 0.56 between threshold 0.74 and 0.75
-at `laya_weight = 0.25` — so re-tune after changing the weight or
-checkpoint.
+### Output sizing
 
-For YAKE sources the measured optimum is **0.75 at `laya_weight =
-0.25`** — start there and confirm with `annif optimize` (see "The
-YAKE profile").
+There is no backend-level threshold: the output is the top-`limit`
+candidates by blended score, and candidates that blend to exactly 0.0
+are dropped. Apply a threshold per call instead (`-t` on the CLI,
+`threshold` in the REST API) — it filters the same blended scores, so
+the effect is identical to an internal threshold. A `threshold` line
+in the project config is ignored by this backend.
+
+With `blend-source = raw` and a high `blend-alpha` the threshold has a
+structural meaning: at `blend-alpha = 0.75`, a threshold of 0.75 admits
+only candidates whose source score is near-perfect — or that Laya's
+answers rank first. "The extractor is confident, unless the verifier
+contradicts it." Just below that point the output floods: extractors
+like YAKE produce a band of near-top candidates whose scores cluster
+just under the top one, and they are mostly wrong. Measured on a
+YAKE-sourced development corpus (in-sample), raising the threshold
+from 0.70 to 0.75 shrank the output from ~7.6 to ~1.8 suggestions per
+document while precision rose from 0.19 to 0.53 — the threshold is a
+cliff, not a dial, so probe around the knee rather than assuming a
+smooth landscape.
+
+### `instruction` — the proposition text
+
+The `{label}` placeholder is required; a proposition without it is a
+configuration error. The default is
+*"This document is about {label}."* Keep propositions short: each one
+is part of the question text of its own question sequence (see the
+token budgets below).
 
 ## Token budgets
 
@@ -112,14 +193,14 @@ Verified from the shipped checkpoint configurations:
 
 Both encoders accept up to 8,192 tokens, but **only when `laya_max_len`
 is explicitly raised** — the 8,192 figure is a capability, not a
-default. Doubling `max_len` doubles the GPU cost per question.
+default. Doubling `max_len` doubles the compute per question.
 
 Neither budget is set by default: the checkpoint's own config applies —
 with the default `multilingual` checkpoint that means 1024/256, reading
-~3,000 characters. A productive override is running the multilingual
-checkpoint at `512/192` (English reading depth): the multilingual model
-is much lighter per token, measured at roughly 6x faster per document
-at the same reading depth.
+~3,000 characters. Note that the question side of each sequence holds
+one proposition in the noul modes, and the choice question holds one
+option per candidate: keep `laya_head_max_len` comfortably above the
+space the questions need, or lower `limit`.
 
 `laya_input_chars` complements the budgets: it truncates the raw text
 *before* it is sent to Laya, so the tokenizer — which would otherwise
@@ -131,137 +212,111 @@ be raised if the budgets are raised.
 
 ## Tuning workflow
 
-Two Annif commands tune this backend, one axis each — chosen to match
-the shape of each parameter's landscape:
+Two kinds of decision, two tools:
 
-| command | tunes | method |
-|---|---|---|
-| `annif optimize` | `threshold` (and per-call output sizing) | exhaustive grid — the right tool for the threshold's cliff-shaped landscape |
-| `annif hyperopt` | `laya_weight`, at the configured limit and threshold | 1D adaptive search over the smooth weight axis; trials re-combine cached answers (~75 ms each) |
+| decision | tool |
+|---|---|
+| ranking config (`blend-alpha`, `blend-source`, `laya_score_mode`) | `annif hyperopt` — trials re-score the answers cached by a single inference pass, so hundreds cost nothing |
+| operating point (per-call `limit`, `threshold`) | `annif eval` sweeps (or the `annif optimize` grid) at the candidate blends |
 
-Step by step, on a validation corpus distinct from your test corpus —
-values tuned on the test set overfit, which was observed repeatedly
+The split matters because the two optima need not agree: hyperopt
+maximizes an *unthresholded* metric over the full candidate pool, which
+rewards ranking; a thresholded operating point rewards confidence, and
+can prefer a very different blend. Paste the hyperopt lines into the
+config only when you serve unthresholded output; for a thresholded
+profile, sweep before deciding.
+
+On a validation corpus distinct from your evaluation corpus — values
+tuned on the evaluation set overfit, which was observed repeatedly
 during development:
 
-1. **Tune the threshold** with `annif optimize`:
+1. **Tune the ranking config** with `annif hyperopt`:
 
    ```bash
-   annif optimize <project> <corpus> -m "F1 score (doc avg)"
+   annif hyperopt <project> <corpus> -T 200 -m "F1 score (doc avg)"
    ```
 
-   Apply its **threshold** recommendation to the project config (for
-   YAKE sources it reliably lands at 0.75 — see "The YAKE profile"). Apply
-   its **limit** recommendation *per call* (`-l N` on eval/suggest),
-   not in the project config — the config's `limit` is the option pool,
-   not an output cap. If a previous round set a `threshold`, remove it
-   from the config first so the sweep sees the full score range.
+   Any metric works, including the default NDCG. The recommendation
+   covers `blend-alpha` and `blend-source`, plus `laya_score_mode` when
+   the configured mode is `choice,noul` (the cached pass then answers
+   both question kinds, so the trials compare all three modes).
 
-2. **Tune the weight** with `annif hyperopt`, at that threshold:
+2. **Find the operating point** by sweeping the per-call `limit` and
+   `threshold` at the candidate blends. In `choice` mode each eval is
+   a single Laya pass over the corpus, so a sweep is cheap:
 
    ```bash
-   annif hyperopt <project> <corpus> -T 100 -m "F1 score (doc avg)"
+   for t in 0.70 0.75 0.80 0.85; do
+       annif eval <project> <corpus> -l 20 -t $t \
+           -b laya.blend-alpha=0.75 -b laya.blend-source=raw
+   done
    ```
 
-   Any metric works for the weight (the threshold is fixed), including
-   the default NDCG. Paste the single recommended `laya_weight` line
-   into the config.
+   Sweep a couple of blends as well — the thresholded optimum can
+   prefer a different `blend-alpha`/`blend-source` than hyperopt's
+   unthresholded one (for a YAKE-like source it does). Remember the
+   cliff: once a threshold looks promising, probe the values just
+   around it.
 
-3. **Iterate if desired**: moving the weight shifts the score
-   distribution, so re-run `annif optimize` (threshold removed) to
-   re-tune the threshold at the new weight. One extra round usually
-   suffices.
+3. **Confirm on a held-out corpus**: set the winning blend in the
+   project config, apply the winning `-l`/`-t` per call, and evaluate
+   once on data that no tuning step has seen. That is the only number
+   to report.
 
-4. **Verify** with `annif eval`:
+## Guidance from development
 
-   ```bash
-   annif eval <project> <corpus> -l <N> -M metrics.json
-   ```
+The backend's value is proportional to the weakness of its source. For
+an already-strong source no variant tested beat the source alone; use
+a trained source when one exists, and Laya where one does not.
 
-   Without `-l`, the CLI applies its default limit of 10. To measure
-   the unthresholded pipeline, override the backend's threshold for the
-   run: `-b laya.threshold=0.0`.
+Findings from tuning a YAKE-sourced project on a 5,664-document corpus
+(in-sample, under the current scoring model):
 
-Use the same corpus and metric for both tuning commands.
+- **`choice` beat `noul` and `choice,noul` for ranking.** With roughly
+  one gold subject per document, the comparative question ("which of
+  these?") fits the problem better than independent per-candidate
+  propositions.
+- **Two optima, two blends.** Unthresholded ranking was best at
+  `blend-alpha ≈ 0.07` with `blend-source = normalized` — nearly pure
+  Laya ranking. The thresholded operating point was best at
+  `blend-alpha = 0.75` with `blend-source = raw` and `-t 0.75` — the
+  "extractor confident unless the verifier contradicts" regime. On the
+  tuning corpus it slightly exceeded the historical tuned profile of
+  the previous scoring model (doc-avg F1 0.573 vs 0.570, both
+  in-sample), and it held doc-avg F1 0.563 on the held-out evaluation
+  corpus — about a point of tuning-corpus optimism, and no sign of
+  overfitting. Neither blend wins both regimes; tune for the regime you
+  deploy.
+- **Ranking strength concentrates at the top.** Precision@1 was
+  ~0.53–0.55 at every operating point, while the second suggestion was
+  right only ~15% of the time: the pipeline is an excellent
+  single-subject extractor, and depth beyond the first hit needs a
+  corpus that actually assigns multiple subjects per document.
 
-## Measured results (5,664 documents, YAKE source)
-
-The backend's value is proportional to the weakness of its source.
-
-**Weak source (YAKE, raw P@1 0.41):** the blend lifts every ranking
-metric at full scale:
-
-| ranking | P@1 | P@3 | P@5 | F1@5 | NDCG |
-|---|---|---|---|---|---|
-| YAKE raw | 0.392 | 0.581 | 0.630 | 0.224 | 0.573 |
-| YAKE + Laya, `laya_weight=0.25` | 0.546 | 0.745 | 0.768 | 0.266 | 0.685 |
-| … with tuned `threshold=0.75` | — | — | — | **0.565** | — |
-
-The threshold more than doubles F1@5 by shrinking returned sets to the
-1–3 highest-confidence subjects. As a fully training-free pipeline
-(YAKE extracts, Laya verifies), this is a strong zero-shot baseline
-for languages or domains where no trained model exists.
-
-**Strong source (MLLM, raw P@1 0.83):** the blend did *not* beat the
-source (0.813 vs 0.828 P@1) in any variant tested — noul or choice
-questions, blended or replaced, gated or not. Use a trained source when
-one exists; use Laya where one does not.
-
-Pool depth (measured, `laya_weight=0.25`): depth 10/15/20 gives
-coverage 0.730/0.778/0.799 and F1@5 0.251/0.262/0.266; P@1 peaks at 15
-(0.554). Depth beyond ~20 does not help: YAKE itself stops producing
-candidates there, and Laya's option accuracy degrades.
-
-Confidence gating (`min_confidence`) was implemented, measured, and
-**removed**: the shipped checkpoints are over-confident, so the gate's
-flagged answers were the helpful ones — gating at 0.75 made results
-*worse* than no gate (P@1 0.808 gated vs 0.820 ungated vs 0.812
-source).
-
-## The YAKE profile
-
-Both corpora tuned during development — independently, with different
-tools — converged on the same operating point: **`laya_weight = 0.25`,
-`threshold = 0.75`**. That is best understood not as a corpus-specific
-tuning result but as the operating profile of the model pair
-"YAKE + zero-shot Laya", and it has a mechanism:
-
-- **The threshold follows YAKE's score distribution.** YAKE scores are
-  document-relative, so the top keyword of almost any document lands
-  near saliency 1.0. At `laya_weight = 0.25`, threshold 0.75 is exactly
-  the boundary "saliency essentially perfect, unless Laya confirms" —
-  a structural feature of YAKE's scoring, not of the text.
-- **The weight follows the reliability ratio between the two models**:
-  trust the zero-shot verifier about 25% against the extractor. That
-  ratio is a property of the model pair, not of the corpus.
-
-For a new YAKE-backed project, start at (0.25, 0.75), confirm the
-threshold with one `annif optimize` run, and skip the weight search
-unless the source is measurably stronger or weaker than usual — a
-stronger source moves the optimum along a diagonal (lower weight,
-higher threshold: on the stronger of the two corpora, (0.125, 0.87)
-bought ~4pp of Precision@1 over the profile point).
-
-**Why the defaults differ.** The backend defaults `laya_weight` to its
-measured value (0.25) but `threshold` to the neutral 0.0. The weight's
-optimum is a property of the model pair and held across both corpora,
-so it is a safe default; the threshold's optimum depends on the
-source's score scale and strength, and hardcoding 0.75 would silently
-shrink the output of any project whose source is not YAKE-like. Set
-the threshold per project: absent tuning, 0.0 is the no-surprise
-default; for YAKE sources, 0.75 is the measured starting point.
+Treat these as direction, not measurement: re-measure on your own
+corpus before making decisions based on them.
 
 ## Operation notes
 
 - **Not trainable.** Training the laya backend raises
   `NotSupportedException`; train the source projects instead.
-- **Hyperopt internals.** `annif hyperopt` runs the source merge and
-  the Laya questions once (`_prepare`), then re-combines the cached
-  `(candidate, probability)` pairs for every trial — the trials cost no
-  inference, so hundreds are cheap. The objective mirrors the backend's
-  exact output path.
-- **Progress logging.** One INFO line per batch:
-  `Laya: 32 doc(s), 155 candidate(s), 1.30s`. Each failed prediction
-  logs a warning; per-question details are at DEBUG level.
-- **Performance.** Cost is one forward pass per document. On Apple
-  Silicon the multilingual checkpoint at `512/192` measured ~40 ms per
-  document; the English checkpoint at the same depth is ~6x slower.
+- **Hyperopt internals.** `annif hyperopt` runs the source merge once
+  and asks Laya the question kinds of the configured mode in a single
+  pass per document (`_prepare`), caching their answers for every
+  candidate. Each trial then re-scores the cache with its own
+  `blend-alpha` and `blend-source` — and `laya_score_mode`, when the
+  cache covers more than one mode — exactly like the backend does at
+  suggest time, so the objective mirrors the backend's output path and
+  the trials cost no inference.
+- **Progress logging.** At suggest time one INFO line per batch:
+  `Laya: 32 doc(s), 155 candidate(s), 1.30s`. During `annif hyperopt`
+  the caching pass reports progress per document batch:
+  `Laya: cached 160/5664 doc(s) (2.8%), 9327 question(s), 48.2s,
+  ~27 min left`. Each failed request logs a warning. At DEBUG
+  (`annif -v DEBUG`): one line per document with its question count
+  and position in the batch, and one line per document listing the
+  candidates whose Laya answer is missing.
+- **Performance.** Cost is one forward pass per document regardless of
+  the candidate count; the mode decides how much question text that
+  pass carries (one choice question, one proposition per candidate,
+  or both).
