@@ -13,6 +13,34 @@ Parameter documentation, measured results and the tuning workflow
 (``annif optimize`` / ``annif hyperopt``) live in docs/laya.md.
 Requires the ``laya`` Python package; the checkpoint is downloaded
 from Hugging Face on first use.
+
+YAKE + Laya works with the following languages:
+
+Arabic	ar
+Danish	da
+German	de
+Greek	el
+English	en
+Spanish	es
+Persian	fa
+Finnish	fi
+French	fr
+Hindi	hi
+Hungarian	hu
+Armenian	hy
+Indonesian	id
+Italian	it
+Japanese	ja
+Latvian	lv
+Dutch	nl
+Polish	pl
+Portuguese	pt
+Romanian	ro
+Russian	ru
+Slovenian	sl
+Swedish	sv
+Turkish	tr
+Chinese	zh
 """
 
 from __future__ import annotations
