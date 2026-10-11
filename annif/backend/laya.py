@@ -170,7 +170,7 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         # option pool for the choice question (and cap on suggestions)
         "limit": 20,
         # instruction of the choice question
-        "question_template": "Which subject does this text reference?",
+        "question_template": "What is the text about?",
         # blend weight: score = w * option_probability + (1 - w) * source
         "laya_weight": 0.25,
         # minimum returned score, applied inside the backend
