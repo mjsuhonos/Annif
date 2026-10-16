@@ -13,3 +13,7 @@ uv.lock
 projects.cfg
 venv/
 .hypothesis/
+fulltext
+projects.d
+.claude/skills/developing-with-streamlit
+.agents/skills/developing-with-streamlit
