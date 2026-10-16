@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import csv
 
+from typing import TYPE_CHECKING
+
 import annif
 import annif.util
 
 from .subject_file import VocabFileCSV
 from .types import Subject, SubjectIndex, VocabSource
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = annif.logger
 logger.addFilter(annif.util.DuplicateFilter())
@@ -42,6 +47,12 @@ class SubjectIndexFile(SubjectIndex):
         if subject.labels is None:
             raise IndexError(f"Subject is deprecated: {subject_id}")
         return subject
+
+    def __iter__(self) -> Iterator[Subject]:
+        # all subjects, including deprecated ones; without this, iteration
+        # falls back to __getitem__, which stops at the first deprecated
+        # subject and silently truncates saves and update merges
+        yield from self._subjects
 
     def append(self, subject: Subject) -> None:
         if self._languages is None and subject.labels is not None:

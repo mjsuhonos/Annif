@@ -30,7 +30,8 @@ def serialize_subjects_to_skos(subjects: Iterator, path: str) -> None:
     graph.namespace_manager.bind("skos", SKOS)
     for subject in subjects:
         graph.add((rdflib.URIRef(subject.uri), RDF.type, SKOS.Concept))
-        for lang, label in subject.labels.items():
+        # labels/notation are None for deprecated or label-less subjects
+        for lang, label in (subject.labels or {}).items():
             graph.add(
                 (
                     rdflib.URIRef(subject.uri),
@@ -38,13 +39,14 @@ def serialize_subjects_to_skos(subjects: Iterator, path: str) -> None:
                     rdflib.Literal(label, lang),
                 )
             )
-        graph.add(
-            (
-                rdflib.URIRef(subject.uri),
-                SKOS.notation,
-                rdflib.Literal(subject.notation),
+        if subject.notation is not None:
+            graph.add(
+                (
+                    rdflib.URIRef(subject.uri),
+                    SKOS.notation,
+                    rdflib.Literal(subject.notation),
+                )
             )
-        )
     graph.serialize(destination=path, format="turtle")
     # also dump the graph in joblib format which is faster to load
     annif.util.atomic_save(
