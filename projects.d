@@ -1,0 +1,1 @@
+../wikicore.nosync/wikicore-20261014-en/projects.d
