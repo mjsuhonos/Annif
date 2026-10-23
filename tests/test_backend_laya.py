@@ -1,13 +1,22 @@
 """Unit tests for the Laya re-scoring ensemble backend in Annif"""
 
 import importlib.util
+import json
+import os
+import sys
+import types
 
 import pytest
 
 import annif.backend
+import annif.corpus
 from annif.backend.laya import LayaBackend
 from annif.corpus import Document
-from annif.exception import NotSupportedException
+from annif.exception import (
+    NotInitializedException,
+    NotSupportedException,
+    OperationFailedException,
+)
 from annif.suggestion import SuggestionBatch, SubjectSuggestion
 
 
@@ -49,11 +58,18 @@ def test_laya_default_params(app_project):
     backend = _make_backend(app_project)
     expected_default_params = {
         "limit": 20,
-        "question_template": "Which subject does this text reference?",
+        "question_template": "What is the text about?",
         "laya_weight": 0.25,
         "threshold": 0.0,
         "laya_model": "multilingual",
         "laya_input_chars": 0,
+        "laya_epochs": 1,
+        "laya_loss": "soft-ce",
+        "laya_micro_batch": 16,
+        "laya_grad_accum": 4,
+        "laya_shuffle_options": False,
+        "laya_freeze_encoder": False,
+        "laya_device": "auto",
     }
     actual_params = backend.params
     for param, val in expected_default_params.items():
@@ -133,7 +149,7 @@ def test_laya_question_is_choice_over_candidates(app_project):
     assert list(questions) == ["the_subject"]
     question = questions["the_subject"]
     assert question["type"] == "choice"
-    assert question["instructions"] == "Which subject does this text reference?"
+    assert question["instructions"] == "What is the text about?"
     assert list(question["criteria"]) == ["dummy"]
 
 
@@ -263,10 +279,263 @@ def test_laya_is_trained_from_sources(app_project):
     assert backend.is_trained
 
 
-def test_laya_train_not_supported(app_project, document_corpus):
-    backend = _make_backend(app_project)
+class FakeTrainConfig:
+    """Stand-in for laya.train.TrainConfig: stores the knobs the
+    backend passes through."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _fake_laya_train(monkeypatch, calls):
+    """Install a fake laya.train module recording finetune() calls; the
+    fake writes a checkpoint layout so the backend reports trained."""
+
+    def finetune(data, model_dir, output_dir, config=None, device=None):
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as f:
+            json.dump({"fine_tuned": True}, f)
+        calls.append(
+            {
+                "data": data,
+                "model_dir": model_dir,
+                "output_dir": output_dir,
+                "config": config,
+                "device": device,
+            }
+        )
+        return {
+            "train_items": 2,
+            "epoch_loss": [1.0, 0.5],
+            "output_dir": output_dir,
+        }
+
+    laya_mod = types.ModuleType("laya")
+    train_mod = types.ModuleType("laya.train")
+    train_mod.TrainConfig = FakeTrainConfig
+    train_mod.finetune = finetune
+    laya_mod.train = train_mod
+    monkeypatch.setitem(sys.modules, "laya", laya_mod)
+    monkeypatch.setitem(sys.modules, "laya.train", train_mod)
+    return finetune
+
+
+def _make_corpus(tmpdir, project, lines):
+    tmpfile = tmpdir.join("documents.tsv")
+    tmpfile.write("".join(lines))
+    return annif.corpus.DocumentFileTSV(str(tmpfile), project.subjects)
+
+
+def _trained_backend(app_project, tmpdir, monkeypatch, calls, config_params=None):
+    backend = _make_backend(app_project, config_params=config_params)
+    backend.datadir = str(tmpdir.mkdir("data"))
+    _fake_laya_train(monkeypatch, calls)
+    return backend
+
+
+def _read_train_rows(backend):
+    path = os.path.join(backend.datadir, backend.TRAIN_FILE)
+    with open(path, encoding="utf-8") as train_file:
+        return [json.loads(line) for line in train_file]
+
+
+def test_laya_train_writes_rows_and_finetunes(app_project, tmpdir, monkeypatch):
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+    corpus = _make_corpus(
+        tmpdir,
+        app_project,
+        [
+            "text about dummy things\thttp://example.org/dummy\n",
+            "another dummy text\thttp://example.org/dummy\n",
+        ],
+    )
+    backend.train(corpus)
+
+    # training data: one row per document, the same choice question the
+    # backend asks at suggest time, gold probabilities keyed by option
+    rows = _read_train_rows(backend)
+    assert len(rows) == 2
+    for row in rows:
+        question = row["questions"]["the_subject"]
+        assert question["type"] == "choice"
+        assert question["instructions"] == "What is the text about?"
+        assert list(question["criteria"]) == ["dummy"]
+        assert row["gold"]["the_subject"]["probabilities"] == {"dummy": 1.0}
+
+    # fine-tuning ran on the training data with the default knobs
+    assert len(calls) == 1
+    assert calls[0]["data"] == os.path.join(backend.datadir, backend.TRAIN_FILE)
+    assert calls[0]["model_dir"] == "multilingual"
+    assert calls[0]["output_dir"] == os.path.join(backend.datadir, backend.MODEL_DIR)
+    assert calls[0]["device"] == "auto"
+    assert calls[0]["config"].epochs == 1
+    assert calls[0]["config"].loss == "soft-ce"
+    assert calls[0]["config"].micro_batch == 16
+    assert calls[0]["config"].grad_accum == 4
+    assert calls[0]["config"].shuffle_options == ()
+    assert calls[0]["config"].freeze_encoder is False
+    assert calls[0]["config"].max_len is None
+    assert calls[0]["config"].head_max_len is None
+
+    # the fine-tuned checkpoint makes the backend trained
+    assert backend.is_trained
+    assert backend.modification_time is not None
+
+
+def test_laya_train_custom_knobs_and_base_model(app_project, tmpdir, monkeypatch):
+    calls = []
+    backend = _trained_backend(
+        app_project,
+        tmpdir,
+        monkeypatch,
+        calls,
+        config_params={
+            "laya_model": "english",
+            "laya_epochs": 2,
+            "laya_loss": "rlcd",
+            "laya_shuffle_options": "true",
+            "laya_device": "cpu",
+            "laya_micro_batch": 32,
+            "laya_grad_accum": 2,
+            "laya_freeze_encoder": "true",
+            "laya_max_len": 512,
+            "laya_head_max_len": 192,
+        },
+    )
+    corpus = _make_corpus(
+        tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
+    )
+    backend.train(corpus)
+
+    assert calls[0]["model_dir"] == "english"
+    assert calls[0]["device"] == "cpu"
+    assert calls[0]["config"].epochs == 2
+    assert calls[0]["config"].loss == "rlcd"
+    assert calls[0]["config"].shuffle_options == ("choice",)
+    assert calls[0]["config"].micro_batch == 32
+    assert calls[0]["config"].grad_accum == 2
+    assert calls[0]["config"].freeze_encoder is True
+    assert calls[0]["config"].max_len == 512
+    assert calls[0]["config"].head_max_len == 192
+
+
+def test_laya_train_skips_documents_without_gold_candidate(
+    app_project, tmpdir, monkeypatch
+):
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+    corpus = _make_corpus(
+        tmpdir,
+        app_project,
+        [
+            "text about dummy things\thttp://example.org/dummy\n",
+            # the dummy source never suggests 'none', so this gold
+            # subject is not among the question options
+            "unrelated text\thttp://example.org/none\n",
+        ],
+    )
+    backend.train(corpus)
+
+    rows = _read_train_rows(backend)
+    assert len(rows) == 1
+    assert rows[0]["gold"]["the_subject"]["probabilities"] == {"dummy": 1.0}
+
+
+def test_laya_train_no_gold_candidates_not_supported(app_project, tmpdir, monkeypatch):
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+    corpus = _make_corpus(
+        tmpdir, app_project, ["unrelated text\thttp://example.org/none\n"]
+    )
     with pytest.raises(NotSupportedException):
-        backend.train(document_corpus)
+        backend.train(corpus)
+    assert calls == []
+
+
+def test_laya_train_empty_corpus_not_supported(app_project, tmpdir, monkeypatch):
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+    with pytest.raises(NotSupportedException):
+        backend.train(annif.corpus.DocumentList([]))
+    assert calls == []
+
+
+def test_laya_train_cached_reuses_train_data(app_project, tmpdir, monkeypatch):
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+    corpus = _make_corpus(
+        tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
+    )
+    backend.train(corpus)
+    assert len(calls) == 1
+
+    backend.train("cached")
+
+    assert len(calls) == 2
+    assert calls[1]["data"] == calls[0]["data"]
+    assert len(_read_train_rows(backend)) == 1
+
+
+def test_laya_train_cached_without_train_data_not_initialized(
+    app_project, tmpdir, monkeypatch
+):
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+    with pytest.raises(NotInitializedException):
+        backend.train("cached")
+    assert calls == []
+
+
+def test_laya_train_without_laya_package(app_project, tmpdir, monkeypatch):
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+    monkeypatch.setitem(sys.modules, "laya", None)
+    monkeypatch.setitem(sys.modules, "laya.train", None)
+    corpus = _make_corpus(
+        tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
+    )
+    with pytest.raises(OperationFailedException):
+        backend.train(corpus)
+    assert calls == []
+
+
+def test_laya_finetuned_model_used_after_training(app_project, tmpdir, monkeypatch):
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+    corpus = _make_corpus(
+        tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
+    )
+    backend.train(corpus)
+    backend.suggest([Document(text="this is some text")])
+
+    _, _, kwargs = backend._router.calls[0]
+    assert kwargs["model"] == "finetuned"
+
+
+def test_laya_explicit_model_param_overrides_finetuned(
+    app_project, tmpdir, monkeypatch
+):
+    calls = []
+    backend = _trained_backend(
+        app_project, tmpdir, monkeypatch, calls, config_params={"laya_model": "english"}
+    )
+    corpus = _make_corpus(
+        tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
+    )
+    backend.train(corpus)
+    backend.suggest([Document(text="this is some text")])
+
+    _, _, kwargs = backend._router.calls[0]
+    assert kwargs["model"] == "english"
+
+
+def test_laya_is_trained_falls_back_to_sources(app_project, tmpdir):
+    backend = _make_backend(app_project)
+    backend.datadir = str(tmpdir.mkdir("data"))
+    # no fine-tuned checkpoint: trained state comes from the sources
+    assert backend.is_trained
+    assert backend._finetuned_model_dir is None
 
 
 class MapRouter(FakeRouter):

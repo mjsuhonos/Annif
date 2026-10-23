@@ -13,11 +13,11 @@ guidance, measured results, and the tuning workflow.
 ## How it works
 
 For each document the backend asks Laya **one choice question** —
-*"Which subject does this text reference?"* — whose options are the
-candidate subjects suggested by the configured source projects. Laya
-compares the candidates against each other and returns a probability
-for every option; each probability is blended with the candidate's
-original source score to produce its final score.
+*"What is the text about?"* — whose options are the candidate subjects
+suggested by the configured source projects. Laya compares the
+candidates against each other and returns a probability for every
+option; each probability is blended with the candidate's original
+source score to produce its final score.
 
 ```
 sources ──> weighted merge (top-`limit` candidates)
@@ -37,7 +37,9 @@ sources ──> weighted merge (top-`limit` candidates)
 Fallbacks: if the prediction fails or the answer carries no
 probabilities (for example when the options overflow the question token
 budget), every candidate of that document keeps its original source
-score. The models are never trained — the pipeline is fully zero-shot.
+score. The pipeline is zero-shot as long as the project has not been
+trained; `annif train` fine-tunes the checkpoint on a labeled corpus
+(see "Training and fine-tuning").
 
 ## Parameters
 
@@ -47,10 +49,16 @@ score. The models are never trained — the pipeline is fully zero-shot.
 | `limit` | option pool: how many merged candidates the choice question compares (and the cap on returned suggestions) | 20 |
 | `laya_weight` | weight of Laya's option probability in the final score | 0.25 |
 | `threshold` | minimum score of returned suggestions, applied inside the backend | 0.0 (YAKE sources: 0.75 — see "The YAKE profile") |
-| `question_template` | the choice question's instruction text | "Which subject does this text reference?" |
+| `question_template` | the choice question's instruction text | "What is the text about?" |
 | `laya_model` | checkpoint | `multilingual` (empty value restores language-based auto-routing) |
-| `laya_max_len` / `laya_head_max_len` | token budgets (see below) | the checkpoint's own values |
+| `laya_max_len` / `laya_head_max_len` | token budgets (see below); also cap fine-tuning, and Laya writes whatever it trained with into the checkpoint, so inference follows training | the checkpoint's own values |
 | `laya_input_chars` | cap on the raw text sent to Laya (tokenizer savings) | 0 = full text |
+| `laya_epochs` | fine-tuning epochs (`annif train` only) | 1 |
+| `laya_loss` | fine-tuning objective: `rlcd` or `soft-ce` | `soft-ce` |
+| `laya_micro_batch` / `laya_grad_accum` | fine-tuning batch shape; their product is the effective batch (the notebook's is 64) | 16 / 4 |
+| `laya_freeze_encoder` | train only the decision head, keep the encoder frozen (faster, less adaptable) | false |
+| `laya_shuffle_options` | shuffle choice options each epoch during fine-tuning (breaks position priors) | false |
+| `laya_device` | device for fine-tuning (`auto`, `cpu`, `cuda`, …) | `auto` |
 
 ### `limit` — the option pool
 
@@ -128,6 +136,55 @@ only its state budget of it — is not fed text that can never be read. A
 value slightly above `(laya_max_len − laya_head_max_len) × 4`
 characters per token is result-neutral for English documents, and must
 be raised if the budgets are raised.
+
+## Training and fine-tuning
+
+The backend is zero-shot until you train it. `annif train` fine-tunes
+the Laya checkpoint itself, using Laya's own training recipe
+(`laya.train.finetune`) on the project corpus:
+
+```bash
+annif train <project> <corpus>
+```
+
+Training data is built the same way the backend works at suggest time:
+for every document the source projects are asked for suggestions, the
+merged candidates become the options of the same choice question the
+backend asks at suggest time, and the document's gold subjects that
+appear among the options become the answer. Documents whose gold
+subjects include none of the candidates are skipped — Laya cannot learn
+from a question whose answer is not among the options — and training
+fails with `NotSupportedException` when no document yields a row.
+
+The fine-tuned checkpoint is saved under the project datadir
+(`laya-model/`) and used **automatically** afterwards, as long as the
+project config does not set `laya_model` explicitly (an explicit
+`laya_model` always wins, so a trained project can still be pointed at
+a stock checkpoint). `is_trained` reports a fine-tuned checkpoint as
+trained; without one it falls back to the trained state of the source
+projects, which is what the zero-shot pipeline needs.
+
+Notes:
+
+- The base checkpoint for fine-tuning is the configured `laya_model`
+  (default `multilingual`); with an empty `laya_model` (language-based
+  routing) fine-tuning starts from `multilingual`, since it needs one
+  concrete checkpoint.
+- `--cached` (`annif train -c`) reuses the preprocessed training rows
+  from the previous run (`laya-train.jsonl` in the project datadir)
+  and only re-runs the fine-tuning itself.
+- Fine-tuning runs on one device (`laya_device`, default `auto`) and
+  does not parallelize across CPU jobs.
+- The default epoch budget (`laya_epochs = 4`) is sized for a few
+  thousand labeled documents; on a few hundred rows the Laya trainer
+  itself warns when predictions collapse to the class prior — use more
+  epochs, more data, or another seed.
+- `laya_shuffle_options` re-encodes choice questions with a random
+  option order each epoch, breaking the position prior that fixed-order
+  options teach; consider it for large corpora.
+- After fine-tuning, re-run the tuning workflow below: the score
+  distribution of a fine-tuned checkpoint differs from the stock one,
+  so both `threshold` and `laya_weight` need re-measuring.
 
 ## Tuning workflow
 
@@ -252,13 +309,16 @@ default; for YAKE sources, 0.75 is the measured starting point.
 
 ## Operation notes
 
-- **Not trainable.** Training the laya backend raises
-  `NotSupportedException`; train the source projects instead.
+- **Trainable by fine-tuning.** `annif train` fine-tunes the Laya
+  checkpoint on a labeled corpus (see "Training and fine-tuning");
+  train the source projects separately as usual. Without training the
+  pipeline is zero-shot.
 - **Hyperopt internals.** `annif hyperopt` runs the source merge and
   the Laya questions once (`_prepare`), then re-combines the cached
   `(candidate, probability)` pairs for every trial — the trials cost no
   inference, so hundreds are cheap. The objective mirrors the backend's
-  exact output path.
+  exact output path, and the questions go to the fine-tuned checkpoint
+  when one has been trained.
 - **Progress logging.** One INFO line per batch:
   `Laya: 32 doc(s), 155 candidate(s), 1.30s`. Each failed prediction
   logs a warning; per-question details are at DEBUG level.
