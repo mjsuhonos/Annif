@@ -11,6 +11,16 @@ zero-shot by default; ``annif train`` can fine-tune the checkpoint on a
 labeled corpus with Laya's own training recipe (``laya.train``), after
 which the fine-tuned checkpoint is used automatically.
 
+With ``source_weights=laya`` the merge itself is re-weighted per
+document (MoE-style): Laya is asked one "noul" question per source
+("Is the document about NAME?") and each answer's P(true) becomes that
+source's weight for the document - optionally blended with the static
+config weight via ``source_laya_weight`` and gated to the top
+``source_top_k`` sources - before the choice-question re-scoring runs
+on the re-merged candidates. ``annif train`` fine-tunes the noul
+questions too in that mode (gold derived from which sources suggested
+gold subjects), over a statically merged candidate pool.
+
 Parameter documentation, measured results and the tuning workflow
 (``annif optimize`` / ``annif hyperopt``) live in docs/laya.md.
 Requires the ``laya`` Python package; the checkpoint is downloaded
@@ -53,6 +63,8 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 import annif.eval
 import annif.util
 from annif.exception import (
@@ -60,7 +72,7 @@ from annif.exception import (
     NotSupportedException,
     OperationFailedException,
 )
-from annif.suggestion import SuggestionBatch, SubjectSuggestion
+from annif.suggestion import SubjectSuggestion, SuggestionBatch, SuggestionResult
 
 from . import hyperopt
 from .ensemble import BaseEnsembleBackend
@@ -75,23 +87,62 @@ if TYPE_CHECKING:
 
 class LayaHPObjective(hyperopt.HPObjective):
     """Objective of the laya hyperparameter optimizer: samples
-    laya_weight values and re-combines the Laya answers cached by
-    _prepare() exactly like the backend does at suggest time - at the
-    configured limit and threshold - so trials need no model
-    inference."""
+    laya_weight (and, when source_weights=laya, source_laya_weight) and
+    re-combines the Laya answers cached by _prepare() exactly like the
+    backend does at suggest time - at the configured limit and
+    threshold - so trials need no model inference. With per-document
+    source weighting the merge depends on source_laya_weight, so each
+    trial re-merges the cached source batches with the sampled weight
+    matrix (cheap sparse math); choice probabilities are cached per
+    subject, and candidates outside the prepare-time option pool keep
+    their merged score, like the suggest-time fallback."""
 
     @classmethod
     def objective(cls, trial: Trial, args) -> float:
         laya_weight = trial.suggest_float("laya_weight", 0.0, 1.0)
+        if args["tune_sources"]:
+            source_laya_weight = trial.suggest_float("source_laya_weight", 0.0, 1.0)
+        else:
+            source_laya_weight = None
         limit = args["limit"]
         threshold = args["threshold"]
+        backend = args["backend"]
 
         eval_batch = annif.eval.EvaluationBatch(args["subject_index"])
-        for verified, gold_batch in zip(args["verified_batches"], args["gold_batches"]):
+        for batch_idx, (verified, gold_batch) in enumerate(
+            zip(args["verified_batches"], args["gold_batches"])
+        ):
+            if args["tune_sources"]:
+                trial_params = dict(args["params"])
+                trial_params["source_laya_weight"] = source_laya_weight
+                weights = np.array(
+                    [
+                        backend._blend_source_weights(
+                            row, args["config_weights"], trial_params
+                        )
+                        for row in args["noul_batches"][batch_idx]
+                    ]
+                )
+            else:
+                weights = np.tile(
+                    np.asarray(args["config_weights"], dtype=np.float64),
+                    (len(verified), 1),
+                )
+            merged = backend._merge_with_weights(
+                args["aligned_batches"][batch_idx], weights, limit
+            )
+            prob_batches = [
+                {
+                    suggestion.subject_id: probability
+                    for suggestion, probability in pairs
+                }
+                for pairs, _status in verified
+            ]
             rescored_results = []
-            for pairs, _status in verified:
+            for row, probs in zip(merged, prob_batches):
                 suggestions = []
-                for suggestion, probability in pairs:
+                for suggestion in row:
+                    probability = probs.get(suggestion.subject_id)
                     if probability is None:
                         score = suggestion.score
                     else:
@@ -114,10 +165,11 @@ class LayaHPObjective(hyperopt.HPObjective):
 
 class LayaOptimizer(hyperopt.HyperparameterOptimizer):
     """Hyperparameter optimizer for the laya backend: selects
-    laya_weight for a labeled corpus, at the limit and threshold
-    configured in the project. _prepare() runs the source merge and the
-    Laya questions once; the trials re-combine the cached answers, so
-    any number of trials costs one inference pass over the corpus.
+    laya_weight (and source_laya_weight when source_weights=laya) for a
+    labeled corpus, at the limit and threshold configured in the
+    project. _prepare() runs the source merge and the Laya questions
+    once; the trials re-combine the cached answers, so any number of
+    trials costs one inference pass over the corpus.
     Tune the threshold with "annif optimize" instead (its grid handles
     the threshold's cliff-shaped landscape); after this optimizer moves
     the weight, re-run optimize to re-tune the threshold at the new
@@ -137,19 +189,39 @@ class LayaOptimizer(hyperopt.HyperparameterOptimizer):
         self._backend.initialize()
         params = self._backend._get_backend_params(None)
         sources = annif.util.parse_sources(params["sources"])
+        tune_sources = self._backend._use_source_weights(sources, params)
 
         verified_batches = []
         gold_batches = []
+        aligned_batches = []
+        noul_batches = []
         for doc_batch in self._corpus.doc_batches:
             docs = list(doc_batch)
             batch_by_source = self._backend._suggest_with_sources(docs, sources)
-            merged = self._backend._merge_source_batches(
-                batch_by_source, sources, params
-            )
+            aligned = [
+                self._backend._align_batch(batch_by_source[project_id], project_id)
+                for project_id, _ in sources
+            ]
+            aligned_batches.append(aligned)
+            if tune_sources:
+                merged, _, noul = self._backend._weighted_source_merge(
+                    docs, batch_by_source, sources, params
+                )
+                noul_batches.append(noul)
+            else:
+                merged = self._backend._merge_source_batches(
+                    batch_by_source, sources, params
+                )
             verified_batches.append(self._backend._verify_batch(docs, merged, params))
             gold_batches.append([doc.subject_set for doc in docs])
 
         return {
+            "backend": self._backend,
+            "params": params,
+            "tune_sources": tune_sources,
+            "config_weights": [weight for _, weight in sources],
+            "aligned_batches": aligned_batches,
+            "noul_batches": noul_batches,
             "verified_batches": verified_batches,
             "gold_batches": gold_batches,
             "subject_index": self._backend.project.subjects,
@@ -159,17 +231,23 @@ class LayaOptimizer(hyperopt.HyperparameterOptimizer):
         }
 
     def _postprocess(self, study: Study) -> hyperopt.HPRecommendation:
-        return hyperopt.HPRecommendation(
-            lines=["laya_weight = {:.4f}".format(study.best_params["laya_weight"])],
-            score=study.best_value,
-        )
+        lines = ["laya_weight = {:.4f}".format(study.best_params["laya_weight"])]
+        if "source_laya_weight" in study.best_params:
+            lines.append(
+                "source_laya_weight = {:.4f}".format(
+                    study.best_params["source_laya_weight"]
+                )
+            )
+        return hyperopt.HPRecommendation(lines=lines, score=study.best_value)
 
 
 class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
     """Ensemble backend that re-scores merged suggestions with Laya by
     asking one choice question whose options are the suggested
-    subjects. Without training the pipeline is zero-shot; annif train
-    fine-tunes the checkpoint on a labeled corpus."""
+    subjects. With source_weights=laya the source merge itself is
+    weighted per document by Laya noul answers (see _merge_for_documents).
+    Without training the pipeline is zero-shot; annif train fine-tunes
+    the checkpoint on a labeled corpus."""
 
     name = "laya"
 
@@ -194,6 +272,19 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         "laya_model": "multilingual",
         # cap on the raw text sent to Laya (tokenizer savings)
         "laya_input_chars": 0,
+        # per-document source weighting (MoE-style): with "laya", ask
+        # one noul question per source and use the answers as the
+        # per-document merge weights; "config" keeps the static weights
+        "source_weights": "config",
+        # instruction of the per-source noul questions; {name} is the
+        # source project's name (falling back to its id), {id} the id
+        "source_question_template": "Is the document about {name}?",
+        # blend of the noul score and the static config weight:
+        # w = source_laya_weight * P_noul + (1 - source_laya_weight) * w_config
+        "source_laya_weight": 1.0,
+        # keep only the top-K sources per document by blended weight
+        # (0 or >= the number of sources: keep all)
+        "source_top_k": 0,
         # fine-tuning knobs, forwarded to laya.train (annif train
         # only); defaults are tuned for speed on large corpora, not
         # for maximum quality (see docs/laya.md)
@@ -271,6 +362,229 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         if params.get("laya_head_max_len"):
             kwargs["head_max_len"] = int(params["laya_head_max_len"])
         return kwargs
+
+    def _source_noul_questions(
+        self, sources: list[tuple[str, float]], params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """One noul question per source, keyed by project id. The
+        answer's P(true) becomes the source's weight for the document.
+        {name} in the template is the source project's name (Project.name
+        falls back to the project id), {id} the project id."""
+
+        template = params.get(
+            "source_question_template",
+            self.DEFAULT_PARAMETERS["source_question_template"],
+        )
+        questions = {}
+        for project_id, _ in sources:
+            project = self.project.registry.get_project(project_id)
+            instructions = template.replace("{name}", project.name).replace(
+                "{id}", project_id
+            )
+            questions[project_id] = {"type": "noul", "instructions": instructions}
+        return questions
+
+    def _source_noul_probabilities(
+        self,
+        documents: list[Document],
+        sources: list[tuple[str, float]],
+        params: dict[str, Any],
+    ) -> tuple[list[list[float | None]], list[str]]:
+        """Ask Laya the per-source noul questions: one predict call per
+        document carrying all n source questions, so the whole pass is
+        a single forward pass per document.
+
+        Returns per document a list of P(true) per source (None when the
+        answer lacks that question) and a status: "ok", "failed" (the
+        predict call raised; the document falls back to config weights)
+        or "no_probabilities"."""
+
+        questions = self._source_noul_questions(sources, params)
+        input_chars = int(params.get("laya_input_chars", 0))
+        predict_kwargs = self._predict_kwargs(params)
+        started = time.monotonic()
+
+        all_probs = []
+        statuses = []
+        for doc in documents:
+            # laya_input_chars truncates the text sent to Laya only, as
+            # in the choice pass; the sources always saw the full text
+            text = doc.text[:input_chars] if input_chars > 0 else doc.text
+            try:
+                answer = self._router.predict(text, questions, **predict_kwargs)
+                answers = answer["answers"]
+            except Exception as err:
+                # keep the static config weights for this document rather
+                # than failing the whole suggestion batch
+                self.warning(
+                    "Laya source weighting failed, keeping config weights: "
+                    "{}".format(err)
+                )
+                all_probs.append([None] * len(sources))
+                statuses.append("failed")
+                continue
+            row = []
+            missing = False
+            for project_id, _ in sources:
+                value = answers.get(project_id)
+                prob = value.get("noul") if isinstance(value, dict) else None
+                if prob is None:
+                    missing = True
+                row.append(float(prob) if prob is not None else None)
+            all_probs.append(row)
+            statuses.append("no_probabilities" if missing else "ok")
+
+        self.info(
+            "Laya source weights: {} doc(s), {} source(s), {:.2f}s".format(
+                len(documents), len(sources), time.monotonic() - started
+            )
+        )
+        return all_probs, statuses
+
+    def _blend_source_weights(
+        self,
+        noul_row: list[float | None],
+        config_weights: list[float],
+        params: dict[str, Any],
+    ) -> np.ndarray:
+        """One document's source weights: blend the noul scores with the
+        static config weights (w = s * P_noul + (1 - s) * w_config, a
+        missing P_noul contributes the config weight alone), then apply
+        the top-K gate keeping the source_top_k largest weights.
+
+        A document whose noul pass failed (all None) and a document whose
+        weights would sum to zero fall back to the config weights. The
+        returned weights are not normalized; _merge_with_weights
+        normalizes per row."""
+
+        source_laya_weight = float(
+            params.get(
+                "source_laya_weight", self.DEFAULT_PARAMETERS["source_laya_weight"]
+            )
+        )
+        top_k = int(params.get("source_top_k", self.DEFAULT_PARAMETERS["source_top_k"]))
+        cw = np.asarray(config_weights, dtype=np.float64)
+        if all(p is None for p in noul_row):
+            return cw.copy()
+        weights = np.array(
+            [
+                (
+                    source_laya_weight * p + (1.0 - source_laya_weight) * w
+                    if p is not None
+                    else w
+                )
+                for p, w in zip(noul_row, cw)
+            ]
+        )
+        n = len(cw)
+        if 0 < top_k < n:
+            # deterministic tie-break: weight desc, config weight desc,
+            # then source order
+            order = sorted(range(n), key=lambda i: (-weights[i], -cw[i], i))
+            keep = set(order[:top_k])
+            weights = np.array([w if i in keep else 0.0 for i, w in enumerate(weights)])
+        if weights.sum() <= 0.0:
+            return cw.copy()
+        return weights
+
+    def _merge_with_weights(
+        self,
+        batches: list[SuggestionBatch],
+        weights: np.ndarray,
+        limit: int,
+    ) -> SuggestionBatch:
+        """Weighted average of aligned source batches with a
+        per-document weight matrix (n_documents x n_sources), normalized
+        per row like SuggestionBatch.from_averaged normalizes its scalar
+        weights."""
+
+        from scipy.sparse import diags
+
+        from annif.suggestion import csr_array
+
+        weights = np.asarray(weights, dtype=np.float64)
+        rowsum = weights.sum(axis=1)
+        rowsum[rowsum <= 0.0] = 1.0
+        total = None
+        for i, batch in enumerate(batches):
+            scaled = csr_array(diags(weights[:, i]) @ batch.array)
+            total = scaled if total is None else total + scaled
+        merged = csr_array(diags(1.0 / rowsum) @ total)
+        # a gated-out source leaves explicit zeros behind; drop them so
+        # its candidates cannot re-enter the option pool with score 0
+        merged.eliminate_zeros()
+        return SuggestionBatch(merged.astype(np.float32)).filter(limit=limit)
+
+    def _weighted_source_merge(
+        self,
+        documents: list[Document],
+        batch_by_source: dict[str, SuggestionBatch],
+        sources: list[tuple[str, float]],
+        params: dict[str, Any],
+    ) -> tuple[SuggestionBatch, list[SuggestionBatch], list[list[float | None]]]:
+        """Merge the source batches with per-document Laya weights: ask
+        the noul source questions, blend the answers with the config
+        weights, apply the top-K gate, and merge with the resulting
+        weight matrix.
+
+        Returns (merged batch, aligned source batches, raw noul
+        probabilities); the latter two let the hyperparameter optimizer
+        re-merge per trial without new Laya calls."""
+
+        config_weights = [weight for _, weight in sources]
+        noul, _statuses = self._source_noul_probabilities(documents, sources, params)
+        weights = np.array(
+            [self._blend_source_weights(row, config_weights, params) for row in noul]
+        )
+        top_k = int(params.get("source_top_k", self.DEFAULT_PARAMETERS["source_top_k"]))
+        if 0 < top_k < len(sources):
+            for doc_idx, row in enumerate(noul):
+                if all(p is None for p in row):
+                    continue
+                dropped = [
+                    project_id
+                    for (project_id, _), w in zip(sources, weights[doc_idx])
+                    if w == 0.0
+                ]
+                if dropped:
+                    self.debug(
+                        "doc {}: top-{} gate dropped source(s) {}".format(
+                            doc_idx, top_k, ",".join(dropped)
+                        )
+                    )
+        batches = [
+            self._align_batch(batch_by_source[project_id], project_id)
+            for project_id, _ in sources
+        ]
+        merged = self._merge_with_weights(batches, weights, int(params["limit"]))
+        return merged, batches, noul
+
+    def _use_source_weights(
+        self, sources: list[tuple[str, float]], params: dict[str, Any]
+    ) -> bool:
+        """Whether per-document Laya source weighting applies: enabled
+        with source_weights=laya and meaningful only with more than one
+        source (a single source's weight always normalizes to 1)."""
+
+        return params.get("source_weights", "config") == "laya" and len(sources) >= 2
+
+    def _merge_for_documents(
+        self,
+        documents: list[Document],
+        batch_by_source: dict[str, SuggestionBatch],
+        sources: list[tuple[str, float]],
+        params: dict[str, Any],
+    ) -> SuggestionBatch:
+        """Merge the source batches, using per-document Laya weights when
+        source_weights=laya and there is more than one source to weigh;
+        otherwise the plain static merge of the ensemble backend."""
+
+        if not self._use_source_weights(sources, params):
+            return self._merge_source_batches(batch_by_source, sources, params)
+        merged, _, _ = self._weighted_source_merge(
+            documents, batch_by_source, sources, params
+        )
+        return merged
 
     def _choice_question(
         self, suggestions: list[SubjectSuggestion], params: dict[str, Any]
@@ -385,12 +699,20 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         params: dict[str, Any],
     ) -> SuggestionBatch:
         """Blend the Laya option probabilities (from _verify_batch) with
-        the source scores, then apply the output limit and threshold."""
+        the source scores, then apply the output limit and threshold.
+        With laya_weight=0.0 the choice pass is skipped entirely (pure
+        MoE mode: the output is the weighted merge, no reranking
+        inference is paid)."""
 
         laya_weight = float(
             params.get("laya_weight", self.DEFAULT_PARAMETERS["laya_weight"])
         )
         threshold = float(params.get("threshold") or 0.0)
+
+        if laya_weight == 0.0:
+            # no reranking: keep the (weighted) merged scores as-is
+            return merged.filter(limit=int(params["limit"]), threshold=threshold)
+
         started = time.monotonic()
 
         verified = self._verify_batch(documents, merged, params)
@@ -441,7 +763,7 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
     ) -> SuggestionBatch:
         sources = annif.util.parse_sources(params["sources"])
         batch_by_source = self._suggest_with_sources(documents, sources)
-        merged = self._merge_source_batches(batch_by_source, sources, params)
+        merged = self._merge_for_documents(documents, batch_by_source, sources, params)
         return self._rescore_with_laya(documents, merged, params)
 
     @property
@@ -471,15 +793,25 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         """Write the Laya fine-tuning data for the corpus: a JSONL file
         of {state, questions, gold} rows, one row per document whose
         gold subjects include at least one of the merged candidates.
-        Each row carries exactly the choice question the backend asks at
-        suggest time, so the fine-tuned checkpoint sees the same
-        question distribution it will be answering."""
+
+        The choice question of each row is the same one the backend asks
+        at suggest time, but over the STATIC merge: the training pool
+        must not be shaped by the stock checkpoint's noul answers, which
+        would drop exactly the documents the stock routing gets wrong.
+        When per-document source weighting is enabled, each row also
+        carries the per-source noul questions with derived gold, so the
+        fine-tuned checkpoint learns the routing it will be asked to do
+        (see _train_row)."""
 
         sources = annif.util.parse_sources(params["sources"])
         for project_id, _ in sources:
             self.project.registry.get_project(project_id).initialize()
 
-        input_chars = int(params.get("laya_input_chars", 0))
+        use_weights = self._use_source_weights(sources, params)
+        noul_questions = (
+            self._source_noul_questions(sources, params) if use_weights else None
+        )
+
         train_path = os.path.join(self.datadir, self.TRAIN_FILE)
         rows = 0
         skipped = 0
@@ -487,32 +819,32 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
             for doc_batch in corpus.doc_batches:
                 docs = list(doc_batch)
                 batch_by_source = self._suggest_with_sources(docs, sources)
+                # static pool on purpose: maximal gold coverage, no
+                # stock-routing bias (see docstring)
                 merged = self._merge_source_batches(batch_by_source, sources, params)
-                for doc, result in zip(docs, merged):
-                    probabilities = {}
-                    questions = None
-                    suggestions = list(result)
-                    if suggestions:
-                        option_text, questions = self._choice_question(
-                            suggestions, params
+                aligned_by_source = None
+                if use_weights:
+                    aligned_by_source = {
+                        project_id: self._align_batch(
+                            batch_by_source[project_id], project_id
                         )
-                        gold_ids = set(doc.subject_set)
-                        probabilities = {
-                            label: 1.0
-                            for label, suggestion in option_text.items()
-                            if suggestion.subject_id in gold_ids
-                        }
-                    if not probabilities:
+                        for project_id, _ in sources
+                    }
+                for doc_index, (doc, result) in enumerate(zip(docs, merged)):
+                    row = self._train_row(
+                        doc,
+                        doc_index,
+                        result,
+                        sources,
+                        params,
+                        noul_questions,
+                        aligned_by_source,
+                    )
+                    if row is None:
                         # Laya cannot learn from a question whose answer
                         # is not among the options
                         skipped += 1
                         continue
-                    text = doc.text[:input_chars] if input_chars > 0 else doc.text
-                    row = {
-                        "state": text,
-                        "questions": questions,
-                        "gold": {"the_subject": {"probabilities": probabilities}},
-                    }
                     print(json.dumps(row, ensure_ascii=False), file=train_file)
                     rows += 1
         self.info(
@@ -523,6 +855,61 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
             raise NotSupportedException(
                 "no document had a gold subject among the merged candidates"
             )
+
+    def _train_row(
+        self,
+        doc: Document,
+        doc_index: int,
+        result: SuggestionResult,
+        sources: list[tuple[str, float]],
+        params: dict[str, Any],
+        noul_questions: dict[str, Any] | None,
+        aligned_by_source: dict[str, SuggestionBatch] | None,
+    ) -> dict[str, Any] | None:
+        """Build one fine-tuning row ({state, questions, gold}) for a
+        document, or None when no gold subject is among the candidates.
+
+        The row carries the choice question over the merged candidates
+        (gold: probability 1.0 for the candidates in the document's gold
+        set). When per-document source weighting is enabled
+        (noul_questions given), it also carries the per-source noul
+        questions, with gold P(true)=1 for each source whose own
+        suggestions include a gold subject of the document and 0
+        otherwise — both keys are set explicitly because Laya's trainer
+        defaults a missing noul key to 0.5."""
+
+        suggestions = list(result)
+        if not suggestions:
+            return None
+        option_text, choice_questions = self._choice_question(suggestions, params)
+        gold_ids = set(doc.subject_set)
+        choice_gold = {
+            label: 1.0
+            for label, suggestion in option_text.items()
+            if suggestion.subject_id in gold_ids
+        }
+        if not choice_gold:
+            return None
+
+        questions = dict(choice_questions)
+        gold = {"the_subject": {"probabilities": choice_gold}}
+        if noul_questions is not None:
+            questions.update(noul_questions)
+            for project_id, _ in sources:
+                source_ids = {
+                    suggestion.subject_id
+                    for suggestion in aligned_by_source[project_id][doc_index]
+                }
+                gold[project_id] = {
+                    "probabilities": {
+                        "false": 0.0,
+                        "true": 1.0 if source_ids & gold_ids else 0.0,
+                    }
+                }
+
+        input_chars = int(params.get("laya_input_chars", 0))
+        text = doc.text[:input_chars] if input_chars > 0 else doc.text
+        return {"state": text, "questions": questions, "gold": gold}
 
     def _train(
         self,

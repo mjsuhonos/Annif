@@ -20,7 +20,14 @@ option; each probability is blended with the candidate's original
 source score to produce its final score.
 
 ```
-sources ──> weighted merge (top-`limit` candidates)
+sources ──> [optional, source_weights=laya:
+            one noul question per source,
+            "Is the document about NAME?"
+            → per-document source weights
+              (blended, top-K gated)]
+              │
+              ▼
+       weighted merge (top-`limit` candidates)
               │
               ▼
        one Laya choice question per document
@@ -43,6 +50,44 @@ trained; `annif train` fine-tunes the checkpoint on a labeled corpus
 
 ## Parameters
 
+Quick reference (as `--help` style; the table below has the details):
+
+```
+laya backend parameters
+=======================
+sources                   (required) source projects "id1:w1,id2:..." — static merge weights
+limit                     20        choice-question option pool and output cap (subjects)
+question_template         "What is the text about?"
+                                    instruction of the per-document choice question
+laya_weight               0.25      rerank blend: score = w·P(option) + (1−w)·source score
+threshold                 0.0       minimum returned score, applied inside the backend
+laya_model                "multilingual"
+                                    checkpoint; empty = Laya routes by document language
+laya_max_len              (unset)   token budget override for Router.predict
+laya_head_max_len         (unset)   question-head token budget override
+laya_input_chars          0         cap on raw text sent to Laya (0 = full text)
+source_weights            "config"  "laya" = per-document source weights from Laya noul answers
+source_question_template  "Is the document about {name}?"
+                                    per-source noul instruction; {name}=project name (fallback id), {id}=id
+source_laya_weight        1.0       MoE blend: w = s·P_noul + (1−s)·config weight
+source_top_k              0         keep only top-K sources per doc by blended weight (0/≥n = keep all)
+
+annif train only (forwarded to laya.train):
+laya_epochs               1         fine-tuning epochs
+laya_loss                 "soft-ce" fine-tuning objective (rlcd | soft-ce)
+laya_micro_batch          16        fine-tuning micro batch size
+laya_grad_accum           4         gradient accumulation steps (× micro_batch = effective batch)
+laya_shuffle_options      false     shuffle choice options each epoch
+laya_freeze_encoder       false     train only the decision head
+laya_device               "auto"    fine-tuning device (auto|cpu|cuda|...)
+```
+
+Notes: `limit` caps subjects, `source_top_k` caps sources per document;
+with `source_weights=laya` each document costs two Laya forward passes
+(noul + choice; only the noul pass when `laya_weight=0`, pure MoE);
+`annif hyperopt` tunes `laya_weight` and, when weighting
+is on, `source_laya_weight`; `annif optimize` tunes `threshold`.
+
 | parameter | meaning | default |
 |---|---|---|
 | `sources` | source projects, as in the plain ensemble | required |
@@ -53,6 +98,10 @@ trained; `annif train` fine-tunes the checkpoint on a labeled corpus
 | `laya_model` | checkpoint | `multilingual` (empty value restores language-based auto-routing) |
 | `laya_max_len` / `laya_head_max_len` | token budgets (see below); also cap fine-tuning, and Laya writes whatever it trained with into the checkpoint, so inference follows training | the checkpoint's own values |
 | `laya_input_chars` | cap on the raw text sent to Laya (tokenizer savings) | 0 = full text |
+| `source_weights` | `config` = static merge weights from `sources`; `laya` = per-document weights from Laya noul answers (see below) | `config` |
+| `source_question_template` | instruction of the per-source noul questions; `{name}` = source project's `name` (falls back to its id), `{id}` = project id | `"Is the document about {name}?"` |
+| `source_laya_weight` | blend of the noul score with the static config weight, per source: `w = s·P_noul + (1−s)·w_config` | 1.0 |
+| `source_top_k` | keep only the top-K sources per document by blended weight (MoE-style gate); 0 or ≥ number of sources = keep all | 0 |
 | `laya_epochs` | fine-tuning epochs (`annif train` only) | 1 |
 | `laya_loss` | fine-tuning objective: `rlcd` or `soft-ce` | `soft-ce` |
 | `laya_micro_batch` / `laya_grad_accum` | fine-tuning batch shape; their product is the effective batch (the notebook's is 64) | 16 / 4 |
@@ -82,6 +131,44 @@ discarded); blending lets one weak signal be rescued by the other.
 The 0.25 default is measured: it beat 0.5, 0.75 and 1.0 at every
 candidate-pool depth on a weak source, and for already-strong sources
 (where blending only hurts) it deviates least from the source ranking.
+
+### Per-document source weighting (MoE-style gating)
+
+With `source_weights=laya` the merge weights are decided **per document**
+instead of being fixed in `sources=`: for n sources the backend sends one
+`noul` question per source — *"Is the document about NAME?"* — in a single
+`predict()` call (one forward pass for all n questions), and each answer's
+P(true) becomes that source's weight for the document. NAME is the source
+project's `name=` from its config, falling back to the project id. The
+questions only make sense when the names denote topics or domains, so name
+source projects accordingly.
+
+Per document and source the weights are then:
+
+```
+w = source_laya_weight · P_noul + (1 − source_laya_weight) · w_config
+```
+
+(the same blend semantics as `laya_weight`), optionally gated to the
+`source_top_k` largest weights, and normalized per document to sum to 1 —
+mirroring how `parse_sources` normalizes the static weights. A gated-out
+source contributes 0 to the merge, so its unique candidates drop out of
+that document's option pool for the choice question.
+
+Top-K is preferred over an absolute threshold gate because it ranks sources
+against each other per document and is therefore independent of the
+checkpoint's probability calibration (the shipped checkpoints are
+over-confident — see "Measured results"). `source_top_k=1` is pure
+winner-take-all routing per document.
+
+Fallbacks, mirroring the choice pass: if the noul `predict()` fails for a
+document, that document keeps the static config weights (and the top-K gate
+does not apply to the fallback); a missing answer for one source gives that
+source its config weight; if the weights would sum to zero, the config
+weights are used. A single source skips the noul pass entirely. When the
+mode is on, the cost is **two forward passes per document** (noul pass +
+choice pass) — they cannot be fused into one call because the choice
+options depend on the weighted merge, which depends on the noul answers.
 
 ### `threshold` — output sizing
 
@@ -156,6 +243,24 @@ subjects include none of the candidates are skipped — Laya cannot learn
 from a question whose answer is not among the options — and training
 fails with `NotSupportedException` when no document yields a row.
 
+With `source_weights=laya` (and more than one source), each training row
+additionally carries the per-source **noul questions**, so the
+fine-tuned checkpoint learns the routing it will be asked to do at
+suggest time. Their gold is derived, not asked: P(true)=1 for every
+source whose own suggestions include a gold subject of the document,
+0 otherwise. Two deliberate deviations from suggest time:
+
+- The choice-option pool is built from the **static** merge, not the
+  per-document weighted one. A stock-checkpoint-gated pool would drop
+  exactly the documents the stock routing gets wrong (their gold
+  candidates fall outside the pool), biasing training toward documents
+  the router already handles; the static pool keeps gold coverage
+  maximal. As a side effect, training-data generation performs **no
+  Laya inference at all** — the noul gold comes from the source
+  batches, not from Laya answers.
+- The noul gold sets both `"false"` and `"true"` explicitly, because
+  Laya's trainer defaults a missing noul key to 0.5.
+
 The fine-tuned checkpoint is saved under the project datadir
 (`laya-model/`) and used **automatically** afterwards, as long as the
 project config does not set `laya_model` explicitly (an explicit
@@ -184,7 +289,9 @@ Notes:
   options teach; consider it for large corpora.
 - After fine-tuning, re-run the tuning workflow below: the score
   distribution of a fine-tuned checkpoint differs from the stock one,
-  so both `threshold` and `laya_weight` need re-measuring.
+  so `threshold`, `laya_weight` and (with `source_weights=laya`)
+  `source_laya_weight` all need re-measuring. All Laya questions —
+  noul and choice — go to the fine-tuned checkpoint afterwards.
 
 ## Tuning workflow
 
@@ -194,7 +301,7 @@ the shape of each parameter's landscape:
 | command | tunes | method |
 |---|---|---|
 | `annif optimize` | `threshold` (and per-call output sizing) | exhaustive grid — the right tool for the threshold's cliff-shaped landscape |
-| `annif hyperopt` | `laya_weight`, at the configured limit and threshold | 1D adaptive search over the smooth weight axis; trials re-combine cached answers (~75 ms each) |
+| `annif hyperopt` | `laya_weight`, and `source_laya_weight` too when `source_weights=laya`; at the configured limit and threshold | adaptive search over the weight axis(es); trials re-combine cached answers (~75 ms each) |
 
 Step by step, on a validation corpus distinct from your test corpus —
 values tuned on the test set overfit, which was observed repeatedly
@@ -220,8 +327,9 @@ during development:
    ```
 
    Any metric works for the weight (the threshold is fixed), including
-   the default NDCG. Paste the single recommended `laya_weight` line
-   into the config.
+   the default NDCG. Paste the recommended `laya_weight` line into the
+   config — plus the `source_laya_weight` line when `source_weights=laya`
+   is enabled.
 
 3. **Iterate if desired**: moving the weight shifts the score
    distribution, so re-run `annif optimize` (threshold removed) to
@@ -239,6 +347,61 @@ during development:
    run: `-b laya.threshold=0.0`.
 
 Use the same corpus and metric for both tuning commands.
+
+### Choosing what to tune: reranking, MoE, or both
+
+The knobs split by which pipeline stage they act on, and that determines
+what you tune them with:
+
+| knob | stage | default | tuned by |
+|---|---|---|---|
+| `source_top_k` | MoE gate (sources, per document) | 0 = off | manual (small integer space) — not auto-tuned |
+| `source_laya_weight` | MoE blend (only with `source_weights=laya`) | 1.0 | `annif hyperopt` (second axis) |
+| `limit` | candidate pool (subjects) | 20 | per-call `-l`; `optimize` recommends |
+| `laya_weight` | rerank blend (subjects) | 0.25 | `annif hyperopt` (first axis) |
+| `threshold` | output filter on the final score | 0.0 | `annif optimize` grid |
+
+**Reranking only** (`source_weights=config`, the default): the existing
+workflow above — `optimize` for `threshold`, `hyperopt` 1-D for
+`laya_weight`, iterate once. The measured (0.25, 0.75) YAKE profile
+applies here unchanged.
+
+**MoE + reranking (both on)**: `hyperopt` becomes 2-D over
+`laya_weight × source_laya_weight`. Two caveats: the two axes are
+correlated — a source Laya dislikes gets suppressed twice (low merge
+weight, and possibly a low choice probability or pool exit) — so expect
+the joint optimum to trade off against the reranking-only profile and to
+need re-measuring; and trials re-merge with the sampled
+`source_laya_weight` using choice probabilities from the prepare-time
+option pool, so candidates entering a trial's pool keep their merged
+score (the same approximation as the suggest-time fallback).
+`source_top_k` stays manual: it is a discrete, per-document cliff knob
+that also reshapes the option pool, so it is the worst fit for a smooth
+sampler. With n sources its space is just 1..n−1, so sweep it by hand
+(K=1 is pure winner-take-all routing). An aggressive K also shrinks the
+pool below `limit` (`limit` is a cap, not a target), which can lower gold
+coverage — the measured coverage ceiling at pool depth 20 only holds if
+the gate does not starve the merge.
+
+**MoE only**: set `laya_weight=0.0` — the choice pass is then skipped
+entirely (no reranking inference is paid), and the output is the
+weighted-merged scores filtered by `limit`/`threshold`.
+
+Cross-cutting rules that span both modes:
+
+- **`threshold` must be re-tuned after changing any weight** — it filters
+  the final blended score, whose distribution depends on `laya_weight`
+  *and* on the MoE weights. Remove it from the config before
+  `annif optimize` so the grid sees the full score range; it is
+  cliff-shaped, so the grid (not hyperopt) is the right tool.
+- **Cost of tuning**: with MoE on, `hyperopt`'s `_prepare` pays both Laya
+  passes once per corpus and trials stay inference-free; but
+  `annif optimize`'s threshold grid re-runs suggest per grid point, so
+  each grid point costs two forward passes per document.
+
+Practical recipe for both modes: fix `source_top_k` by hand →
+`annif hyperopt` (2-D weights) → `annif optimize` (threshold) → optionally
+re-run hyperopt at the new threshold.
 
 ## Measured results (5,664 documents, YAKE source)
 
@@ -318,10 +481,20 @@ default; for YAKE sources, 0.75 is the measured starting point.
   `(candidate, probability)` pairs for every trial — the trials cost no
   inference, so hundreds are cheap. The objective mirrors the backend's
   exact output path, and the questions go to the fine-tuned checkpoint
-  when one has been trained.
+  when one has been trained. With `source_weights=laya`, `_prepare`
+  additionally caches the aligned source batches and the noul answers;
+  each trial re-merges them with the sampled `source_laya_weight`
+  (sparse math, no inference) and joins the cached choice probabilities
+  by subject — candidates outside the prepare-time option pool keep
+  their merged score, the same fallback the backend applies at suggest
+  time.
 - **Progress logging.** One INFO line per batch:
-  `Laya: 32 doc(s), 155 candidate(s), 1.30s`. Each failed prediction
-  logs a warning; per-question details are at DEBUG level.
-- **Performance.** Cost is one forward pass per document. On Apple
+  `Laya: 32 doc(s), 155 candidate(s), 1.30s`, and with
+  `source_weights=laya` also `Laya source weights: 32 doc(s), 2
+  source(s), 1.28s`. Each failed prediction logs a warning; per-question
+  details are at DEBUG level.
+- **Performance.** Cost is one forward pass per document, or two when
+  `source_weights=laya` is enabled (the noul pass cannot be fused with
+  the choice pass — see above). On Apple
   Silicon the multilingual checkpoint at `512/192` measured ~40 ms per
   document; the English checkpoint at the same depth is ~6x slower.

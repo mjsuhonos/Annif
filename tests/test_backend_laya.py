@@ -10,6 +10,7 @@ import pytest
 
 import annif.backend
 import annif.corpus
+import annif.util
 from annif.backend.laya import LayaBackend
 from annif.corpus import Document
 from annif.exception import (
@@ -17,7 +18,7 @@ from annif.exception import (
     NotSupportedException,
     OperationFailedException,
 )
-from annif.suggestion import SuggestionBatch, SubjectSuggestion
+from annif.suggestion import SubjectSuggestion, SuggestionBatch
 
 
 class FakeRouter:
@@ -63,6 +64,10 @@ def test_laya_default_params(app_project):
         "threshold": 0.0,
         "laya_model": "multilingual",
         "laya_input_chars": 0,
+        "source_weights": "config",
+        "source_question_template": "Is the document about {name}?",
+        "source_laya_weight": 1.0,
+        "source_top_k": 0,
         "laya_epochs": 1,
         "laya_loss": "soft-ce",
         "laya_micro_batch": 16,
@@ -487,6 +492,125 @@ def test_laya_train_cached_without_train_data_not_initialized(
     assert calls == []
 
 
+def test_laya_train_multi_source_includes_noul_questions(
+    app_project, tmpdir, monkeypatch
+):
+    # with source_weights=laya and two sources, each training row also
+    # carries the per-source noul questions with derived gold, and the
+    # training-data generation does not call Laya at all (the pool is
+    # the static merge)
+    calls = []
+    backend = _trained_backend(
+        app_project,
+        tmpdir,
+        monkeypatch,
+        calls,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+        },
+    )
+    corpus = _make_corpus(
+        tmpdir,
+        app_project,
+        [
+            "text about dummy things\thttp://example.org/dummy\n",
+            "another dummy text\thttp://example.org/dummy\n",
+        ],
+    )
+    backend.train(corpus)
+
+    # no Laya inference during training-data generation
+    assert backend._router.calls == []
+
+    rows = _read_train_rows(backend)
+    assert len(rows) == 2
+    for row in rows:
+        assert set(row["questions"]) == {"the_subject", "dummy-en", "dummy-private"}
+        assert row["questions"]["the_subject"]["type"] == "choice"
+        assert row["questions"]["dummy-en"] == {
+            "type": "noul",
+            "instructions": "Is the document about Dummy English?",
+        }
+        assert row["questions"]["dummy-private"] == {
+            "type": "noul",
+            "instructions": "Is the document about Dummy private project?",
+        }
+        # both dummy sources suggest the gold subject 'dummy'
+        assert row["gold"]["the_subject"]["probabilities"] == {"dummy": 1.0}
+        assert row["gold"]["dummy-en"]["probabilities"] == {"false": 0.0, "true": 1.0}
+        assert row["gold"]["dummy-private"]["probabilities"] == {
+            "false": 0.0,
+            "true": 1.0,
+        }
+
+
+def test_laya_train_multi_source_without_laya_weights_is_choice_only(
+    app_project, tmpdir, monkeypatch
+):
+    # with the default source_weights=config, training rows carry only
+    # the choice question even with two sources
+    calls = []
+    backend = _trained_backend(
+        app_project,
+        tmpdir,
+        monkeypatch,
+        calls,
+        config_params={"sources": "dummy-en,dummy-private"},
+    )
+    corpus = _make_corpus(
+        tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
+    )
+    backend.train(corpus)
+
+    rows = _read_train_rows(backend)
+    assert len(rows) == 1
+    assert set(rows[0]["questions"]) == {"the_subject"}
+    assert set(rows[0]["gold"]) == {"the_subject"}
+
+
+def test_laya_train_row_noul_gold_comes_from_source_hits(app_project):
+    # unit test of _train_row: dummy-en suggests the gold subject,
+    # dummy-private suggests a non-gold one -> noul gold 1.0 vs 0.0
+    from annif.corpus.types import SubjectSet
+
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+        },
+    )
+    params = backend._get_backend_params(None)
+    sources = annif.util.parse_sources(params["sources"])
+    noul_questions = backend._source_noul_questions(sources, params)
+
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    aligned_by_source = _two_source_batches(app_project)
+    merged = SuggestionBatch.from_sequence(
+        [[SubjectSuggestion(subject_id=dummy_id, score=1.0)]], app_project.subjects
+    )
+    doc = Document(text="some text", subject_set=SubjectSet([dummy_id]))
+
+    row = backend._train_row(
+        doc, 0, merged[0], sources, params, noul_questions, aligned_by_source
+    )
+    assert set(row["questions"]) == {"the_subject", "dummy-en", "dummy-private"}
+    assert row["gold"]["the_subject"]["probabilities"] == {"dummy": 1.0}
+    assert row["gold"]["dummy-en"]["probabilities"] == {"false": 0.0, "true": 1.0}
+    assert row["gold"]["dummy-private"]["probabilities"] == {"false": 0.0, "true": 0.0}
+
+    # a document whose gold is not among the candidates yields no row
+    doc_none = Document(text="other text", subject_set=SubjectSet([none_id]))
+    assert (
+        backend._train_row(
+            doc_none, 0, merged[0], sources, params, noul_questions, aligned_by_source
+        )
+        is None
+    )
+
+
 def test_laya_train_without_laya_package(app_project, tmpdir, monkeypatch):
     calls = []
     backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
@@ -558,6 +682,338 @@ class MapRouter(FakeRouter):
                 }
             }
         }
+
+
+class NoulRouter(FakeRouter):
+    """FakeRouter variant that also answers the per-source noul
+    questions, with a fixed P(true) per question id. A qid missing from
+    noul_probs simulates an answer that lacks that question; fail_noul
+    simulates the whole noul pass raising."""
+
+    def __init__(self, noul_probs=None, probability=0.5, fail_noul=False):
+        super().__init__(probability=probability)
+        self.noul_probs = noul_probs or {}
+        self.fail_noul = fail_noul
+
+    def predict(self, state, questions, **kwargs):
+        self.calls.append((state, questions, kwargs))
+        if self.fail_noul and any(q["type"] == "noul" for q in questions.values()):
+            raise RuntimeError("fake Laya noul failure")
+        answers = {}
+        for qid, question in questions.items():
+            if question["type"] == "noul":
+                if qid in self.noul_probs:
+                    answers[qid] = {"type": "noul", "noul": self.noul_probs[qid]}
+            else:
+                options = list(question["criteria"])
+                answers[qid] = {
+                    "type": "choice",
+                    "choice": options[0],
+                    "probabilities": {o: self.probability for o in options},
+                }
+        return {"answers": answers}
+
+
+def _two_source_batches(app_project):
+    """Hand-built per-source batches where dummy-en suggests 'dummy' and
+    dummy-private suggests 'none', both with score 1.0."""
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    return {
+        "dummy-en": SuggestionBatch.from_sequence(
+            [[SubjectSuggestion(subject_id=dummy_id, score=1.0)]], app_project.subjects
+        ),
+        "dummy-private": SuggestionBatch.from_sequence(
+            [[SubjectSuggestion(subject_id=none_id, score=1.0)]], app_project.subjects
+        ),
+    }
+
+
+def _merge_two_sources(backend, app_project, router, config_params=None):
+    """Run _merge_for_documents over the hand-built two-source batches
+    and return {subject_id: score} of the single merged row."""
+    backend._router = router
+    params = backend._get_backend_params(None)
+    sources = annif.util.parse_sources(params["sources"])
+    merged = backend._merge_for_documents(
+        [Document(text="some text")], _two_source_batches(app_project), sources, params
+    )
+    return {s.subject_id: s.score for s in merged[0]}
+
+
+def test_laya_source_weights_off_by_default_sends_no_noul(app_project):
+    # with the default source_weights=config no noul questions are sent,
+    # only the choice question
+    backend = _make_backend(
+        app_project,
+        config_params={"sources": "dummy-en,dummy-private"},
+        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
+    )
+    backend.suggest([Document(text="this is some text")])
+
+    assert len(backend._router.calls) == 1
+    _, questions, _ = backend._router.calls[0]
+    assert list(questions) == ["the_subject"]
+
+
+def test_laya_source_weights_sends_one_noul_question_per_source(app_project):
+    backend = _make_backend(
+        app_project,
+        config_params={"sources": "dummy-en,dummy-private", "source_weights": "laya"},
+        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
+    )
+    backend.suggest([Document(text="this is some text")])
+
+    # first call: the noul questions, keyed by project id, using the
+    # projects' names; second call: the choice question
+    assert len(backend._router.calls) == 2
+    _, questions, _ = backend._router.calls[0]
+    assert questions == {
+        "dummy-en": {
+            "type": "noul",
+            "instructions": "Is the document about Dummy English?",
+        },
+        "dummy-private": {
+            "type": "noul",
+            "instructions": "Is the document about Dummy private project?",
+        },
+    }
+    _, choice_questions, _ = backend._router.calls[1]
+    assert list(choice_questions) == ["the_subject"]
+
+
+def test_laya_source_question_template_placeholders(app_project):
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+            "source_question_template": "Topic {name} ({id})?",
+        },
+        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
+    )
+    backend.suggest([Document(text="this is some text")])
+
+    _, questions, _ = backend._router.calls[0]
+    assert questions["dummy-en"]["instructions"] == "Topic Dummy English (dummy-en)?"
+    assert (
+        questions["dummy-private"]["instructions"]
+        == "Topic Dummy private project (dummy-private)?"
+    )
+
+
+def test_laya_per_document_weights_change_the_merge(app_project):
+    # source_laya_weight=1.0: the noul scores are the weights, normalized
+    # per document -> dummy 0.9, none 0.1
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+            "source_laya_weight": 1.0,
+        },
+    )
+    hits = _merge_two_sources(
+        backend, app_project, NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1})
+    )
+
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    assert hits[dummy_id] == pytest.approx(0.9)
+    assert hits[none_id] == pytest.approx(0.1)
+
+
+def test_laya_source_laya_weight_blends_with_config_weight(app_project):
+    # w = s * P_noul + (1 - s) * w_config: s=0.5, P=1.0/0.0, config
+    # 0.75/0.25 -> 0.875/0.125
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en:0.75,dummy-private:0.25",
+            "source_weights": "laya",
+            "source_laya_weight": 0.5,
+        },
+    )
+    hits = _merge_two_sources(
+        backend, app_project, NoulRouter({"dummy-en": 1.0, "dummy-private": 0.0})
+    )
+
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    assert hits[dummy_id] == pytest.approx(0.875)
+    assert hits[none_id] == pytest.approx(0.125)
+
+
+def test_laya_missing_noul_answer_uses_config_weight(app_project):
+    # an answer lacking one question gives that source its config weight:
+    # w = (0.8, 0.5) -> normalized 0.8/1.3 and 0.5/1.3
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+            "source_laya_weight": 1.0,
+        },
+    )
+    hits = _merge_two_sources(backend, app_project, NoulRouter({"dummy-en": 0.8}))
+
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    assert hits[dummy_id] == pytest.approx(0.8 / 1.3)
+    assert hits[none_id] == pytest.approx(0.5 / 1.3)
+
+
+def test_laya_source_top_k_drops_low_weight_sources(app_project):
+    # top_k=1 keeps only dummy-en; dummy-private's candidate gets weight
+    # 0 and disappears from the merged row
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+            "source_laya_weight": 1.0,
+            "source_top_k": 1,
+        },
+    )
+    hits = _merge_two_sources(
+        backend, app_project, NoulRouter({"dummy-en": 0.6, "dummy-private": 0.4})
+    )
+
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    assert hits[dummy_id] == pytest.approx(1.0)
+    assert none_id not in hits
+
+
+def test_laya_source_top_k_keeps_all_when_k_covers_sources(app_project):
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+            "source_laya_weight": 1.0,
+            "source_top_k": 2,
+        },
+    )
+    hits = _merge_two_sources(
+        backend, app_project, NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1})
+    )
+
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    assert hits[dummy_id] == pytest.approx(0.9)
+    assert hits[none_id] == pytest.approx(0.1)
+
+
+def test_laya_source_weighting_failure_falls_back_to_config_weights(app_project):
+    # a failed noul pass keeps the static config weights (and the top-K
+    # gate does not apply to the fallback): config 0.9/0.1
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en:0.9,dummy-private:0.1",
+            "source_weights": "laya",
+            "source_top_k": 1,
+        },
+    )
+    hits = _merge_two_sources(backend, app_project, NoulRouter(fail_noul=True))
+
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    assert hits[dummy_id] == pytest.approx(0.9)
+    assert hits[none_id] == pytest.approx(0.1)
+
+
+def test_laya_weight_zero_skips_the_choice_pass(app_project):
+    # laya_weight=0.0: no choice question is sent at all, the output is
+    # the merged source score as-is
+    backend = _make_backend(
+        app_project,
+        config_params={"laya_weight": 0.0},
+        router=FakeRouter(probability=0.9),
+    )
+    result = backend.suggest([Document(text="this is some text")])[0]
+
+    assert backend._router.calls == []
+    hits = list(result)
+    assert len(hits) == 1
+    assert hits[0].score == pytest.approx(1.0)
+
+
+def test_laya_moe_only_sends_noul_but_no_choice(app_project):
+    # source_weights=laya + laya_weight=0.0: only the noul pass runs
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+            "laya_weight": 0.0,
+        },
+        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
+    )
+    result = backend.suggest([Document(text="this is some text")])[0]
+
+    assert len(backend._router.calls) == 1
+    _, questions, _ = backend._router.calls[0]
+    assert set(questions) == {"dummy-en", "dummy-private"}
+    assert all(q["type"] == "noul" for q in questions.values())
+    hits = list(result)
+    assert len(hits) == 1
+    assert hits[0].subject_id == app_project.subjects.by_uri("http://example.org/dummy")
+    assert hits[0].score == pytest.approx(1.0)
+
+
+def test_laya_single_source_skips_the_noul_pass(app_project):
+    # with one source there is nothing to weigh: no noul questions
+    backend = _make_backend(
+        app_project,
+        config_params={"source_weights": "laya"},
+        router=NoulRouter({"dummy-en": 0.9}),
+    )
+    backend.suggest([Document(text="this is some text")])
+
+    assert len(backend._router.calls) == 1
+    _, questions, _ = backend._router.calls[0]
+    assert list(questions) == ["the_subject"]
+
+
+def test_laya_hyperopt_tunes_source_weight_too(app_project, tmpdir):
+    # with source_weights=laya the optimizer samples source_laya_weight
+    # next to laya_weight and recommends two config lines
+    from annif.corpus import DocumentFileTSV
+
+    tmpfile = tmpdir.join("documents.tsv")
+    tmpfile.write(
+        "text about dummy things\thttp://example.org/dummy\n"
+        "another dummy text\thttp://example.org/dummy\n"
+        "totally unrelated content\thttp://example.org/none\n"
+    )
+    corpus = DocumentFileTSV(str(tmpfile), app_project.subjects)
+
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en,dummy-private",
+            "source_weights": "laya",
+            "threshold": 0.75,
+        },
+        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}, probability=0.9),
+    )
+    optimizer = backend.get_hp_optimizer(corpus, "F1 score (doc avg)")
+
+    args = optimizer._prepare(1)
+    assert args["tune_sources"]
+    assert len(args["noul_batches"]) == len(args["verified_batches"])
+
+    rec = optimizer.optimize(4, 1, None)
+
+    assert rec.score >= 0.0
+    assert len(rec.lines) == 2
+    assert rec.lines[0].startswith("laya_weight = ")
+    assert rec.lines[1].startswith("source_laya_weight = ")
+    for line in rec.lines:
+        value = float(line.split("=")[1])
+        assert 0.0 <= value <= 1.0
 
 
 def test_laya_output_limit_ranks_by_blended_score(app_project):
