@@ -611,6 +611,71 @@ def test_laya_train_row_noul_gold_comes_from_source_hits(app_project):
     )
 
 
+def test_laya_train_patches_laya_forward_device(app_project, tmpdir, monkeypatch):
+    # _train wraps laya.train._forward so the model is moved to the batch
+    # device before every forward (upstream MPS multi-question bug)
+    import torch
+
+    calls = []
+    backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
+
+    laya_mod = types.ModuleType("laya")
+    train_mod = types.ModuleType("laya.train")
+    train_mod.TrainConfig = FakeTrainConfig
+
+    def finetune(data, model_dir, output_dir, config=None, device=None):
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as f:
+            json.dump({"fine_tuned": True}, f)
+        calls.append({"data": data, "device": device})
+        return {"train_items": 1, "epoch_loss": [0.5]}
+
+    def _forward(model, batch, device, amp, detach_encoder):
+        return model(batch, device)
+
+    train_mod.finetune = finetune
+    train_mod._forward = _forward
+    laya_mod.train = train_mod
+    monkeypatch.setitem(sys.modules, "laya", laya_mod)
+    monkeypatch.setitem(sys.modules, "laya.train", train_mod)
+
+    class FakeModel:
+        def __init__(self):
+            self.param = torch.nn.Parameter(torch.zeros(1))  # cpu
+            self.moved_to = None
+
+        def parameters(self):
+            return iter([self.param])
+
+        def to(self, device):
+            self.moved_to = device
+            self.param = torch.nn.Parameter(torch.zeros(1, device=device))
+            return self
+
+        def __call__(self, batch, device):
+            return "logits"
+
+    corpus = _make_corpus(
+        tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
+    )
+    backend.train(corpus)
+
+    # the patch was installed on the fake laya.train
+    assert getattr(train_mod, "_annif_forward_device_patched", False)
+    wrapped = train_mod._forward
+    assert wrapped is not _forward
+
+    # calling the wrapped _forward with a different device moves the model first
+    model = FakeModel()
+    other = torch.device("meta")
+    assert wrapped(model, {}, other, False, False) == "logits"
+    assert model.moved_to == other
+    # a second call with the model already on the device does not move again
+    model.moved_to = None
+    assert wrapped(model, {}, other, False, False) == "logits"
+    assert model.moved_to is None
+
+
 def test_laya_train_without_laya_package(app_project, tmpdir, monkeypatch):
     calls = []
     backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)

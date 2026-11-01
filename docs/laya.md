@@ -280,6 +280,14 @@ Notes:
   and only re-runs the fine-tuning itself.
 - Fine-tuning runs on one device (`laya_device`, default `auto`) and
   does not parallelize across CPU jobs.
+- **MPS workaround.** Upstream laya (0.3.29, 0.4.18) runs its pre-training
+  calibration forward before moving the model to the target device, so
+  on Apple Silicon with multi-question training rows (i.e.
+  `source_weights=laya`) it crashes with `Passed CPU tensor to MPS op`.
+  The backend monkeypatches `laya.train._forward` to move the model to
+  the batch device first (a no-op when it already is); remove the patch
+  in `_patch_laya_train_forward_device` once upstream fixes it. Until
+  then, `laya_device=cpu` also works around it.
 - The default epoch budget (`laya_epochs = 4`) is sized for a few
   thousand labeled documents; on a few hundred rows the Laya trainer
   itself warns when predictions collapse to the class prior — use more

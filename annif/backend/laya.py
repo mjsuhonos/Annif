@@ -911,6 +911,41 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         text = doc.text[:input_chars] if input_chars > 0 else doc.text
         return {"state": text, "questions": questions, "gold": gold}
 
+    def _patch_laya_train_forward_device(self, laya_train) -> None:
+        """Short-term workaround for an upstream laya bug (present in
+        0.3.29 and 0.4.18): finetune() runs its pre-training calibration
+        forward (calibration_records) BEFORE train_model() moves the
+        model to the target device. With multi-question training rows
+        the eval split is non-empty, so on MPS the still-CPU model gets
+        an MPS batch and crashes with 'Passed CPU tensor to MPS op'.
+
+        Wraps laya.train._forward so the model is on the batch device
+        before every forward; a no-op when it already is, on any device.
+        Remove once upstream moves the model right after load_checkpoint."""
+
+        if getattr(laya_train, "_annif_forward_device_patched", False):
+            return
+        orig_forward = getattr(laya_train, "_forward", None)
+        if orig_forward is None:
+            # unknown laya version without a module-level _forward; nothing
+            # to patch (and nothing known to be broken)
+            self.debug(
+                "laya.train has no _forward to patch, skipping device workaround"
+            )
+            return
+
+        def _forward(model, batch, device, amp, detach_encoder):
+            if next(model.parameters()).device != device:
+                model.to(device)
+            return orig_forward(model, batch, device, amp, detach_encoder)
+
+        laya_train._forward = _forward
+        laya_train._annif_forward_device_patched = True
+        self.info(
+            "applied Annif workaround for laya train device placement "
+            "(upstream bug, MPS multi-question rows)"
+        )
+
     def _train(
         self,
         corpus: DocumentCorpus,
@@ -949,11 +984,13 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
             )
         )
         try:
+            import laya.train as laya_train
             from laya.train import TrainConfig, finetune
         except ImportError as err:
             raise OperationFailedException(
                 "Laya package not available, cannot train laya backend"
             ) from err
+        self._patch_laya_train_forward_device(laya_train)
 
         shuffle = annif.util.boolean(params.get("laya_shuffle_options", False))
         micro_batch = int(
