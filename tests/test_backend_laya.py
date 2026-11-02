@@ -64,7 +64,7 @@ def test_laya_default_params(app_project):
         "threshold": 0.0,
         "laya_model": "multilingual",
         "laya_input_chars": 0,
-        "source_weights": "config",
+        "source_weights": False,
         "source_question_template": "Is the document about {name}?",
         "source_laya_weight": 1.0,
         "source_top_k": 0,
@@ -355,7 +355,7 @@ def test_laya_train_writes_rows_and_finetunes(app_project, tmpdir, monkeypatch):
             "another dummy text\thttp://example.org/dummy\n",
         ],
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
 
     # training data: one row per document, the same choice question the
     # backend asks at suggest time, gold probabilities keyed by option
@@ -411,7 +411,7 @@ def test_laya_train_custom_knobs_and_base_model(app_project, tmpdir, monkeypatch
     corpus = _make_corpus(
         tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
 
     assert calls[0]["model_dir"] == "english"
     assert calls[0]["device"] == "cpu"
@@ -440,7 +440,7 @@ def test_laya_train_skips_documents_without_gold_candidate(
             "unrelated text\thttp://example.org/none\n",
         ],
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
 
     rows = _read_train_rows(backend)
     assert len(rows) == 1
@@ -454,7 +454,7 @@ def test_laya_train_no_gold_candidates_not_supported(app_project, tmpdir, monkey
         tmpdir, app_project, ["unrelated text\thttp://example.org/none\n"]
     )
     with pytest.raises(NotSupportedException):
-        backend.train(corpus)
+        backend.train(corpus, jobs=1)
     assert calls == []
 
 
@@ -472,7 +472,7 @@ def test_laya_train_cached_reuses_train_data(app_project, tmpdir, monkeypatch):
     corpus = _make_corpus(
         tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
     assert len(calls) == 1
 
     backend.train("cached")
@@ -495,7 +495,7 @@ def test_laya_train_cached_without_train_data_not_initialized(
 def test_laya_train_multi_source_includes_noul_questions(
     app_project, tmpdir, monkeypatch
 ):
-    # with source_weights=laya and two sources, each training row also
+    # with source_weights=true and two sources, each training row also
     # carries the per-source noul questions with derived gold, and the
     # training-data generation does not call Laya at all (the pool is
     # the static merge)
@@ -507,7 +507,7 @@ def test_laya_train_multi_source_includes_noul_questions(
         calls,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
         },
     )
     corpus = _make_corpus(
@@ -518,7 +518,7 @@ def test_laya_train_multi_source_includes_noul_questions(
             "another dummy text\thttp://example.org/dummy\n",
         ],
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
 
     # no Laya inference during training-data generation
     assert backend._router.calls == []
@@ -548,7 +548,7 @@ def test_laya_train_multi_source_includes_noul_questions(
 def test_laya_train_multi_source_without_laya_weights_is_choice_only(
     app_project, tmpdir, monkeypatch
 ):
-    # with the default source_weights=config, training rows carry only
+    # with the default source_weights=false, training rows carry only
     # the choice question even with two sources
     calls = []
     backend = _trained_backend(
@@ -561,7 +561,7 @@ def test_laya_train_multi_source_without_laya_weights_is_choice_only(
     corpus = _make_corpus(
         tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
 
     rows = _read_train_rows(backend)
     assert len(rows) == 1
@@ -578,7 +578,7 @@ def test_laya_train_row_noul_gold_comes_from_source_hits(app_project):
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
         },
     )
     params = backend._get_backend_params(None)
@@ -658,7 +658,7 @@ def test_laya_train_patches_laya_forward_device(app_project, tmpdir, monkeypatch
     corpus = _make_corpus(
         tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
 
     # the patch was installed on the fake laya.train
     assert getattr(train_mod, "_annif_forward_device_patched", False)
@@ -676,6 +676,32 @@ def test_laya_train_patches_laya_forward_device(app_project, tmpdir, monkeypatch
     assert model.moved_to is None
 
 
+def test_laya_train_data_parallel_matches_single_job(app_project, tmpdir, monkeypatch):
+    # the same training rows are written with jobs=1 (threads) and
+    # jobs=2 (process pool), in any order
+    calls = []
+    corpus = _make_corpus(
+        tmpdir,
+        app_project,
+        [
+            "text about dummy things\thttp://example.org/dummy\n",
+            "another dummy text\thttp://example.org/dummy\n",
+            "unrelated text\thttp://example.org/none\n",
+        ],
+    )
+    rows_by_jobs = {}
+    for jobs in (1, 2):
+        backend = _trained_backend(
+            app_project, tmpdir.mkdir(f"data{jobs}"), monkeypatch, calls
+        )
+        backend.train(corpus, jobs=jobs)
+        rows_by_jobs[jobs] = sorted(
+            json.dumps(r, sort_keys=True) for r in _read_train_rows(backend)
+        )
+    assert rows_by_jobs[1] == rows_by_jobs[2]
+    assert len(rows_by_jobs[1]) == 2  # the 'none'-gold doc is skipped
+
+
 def test_laya_train_without_laya_package(app_project, tmpdir, monkeypatch):
     calls = []
     backend = _trained_backend(app_project, tmpdir, monkeypatch, calls)
@@ -685,7 +711,7 @@ def test_laya_train_without_laya_package(app_project, tmpdir, monkeypatch):
         tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
     )
     with pytest.raises(OperationFailedException):
-        backend.train(corpus)
+        backend.train(corpus, jobs=1)
     assert calls == []
 
 
@@ -695,7 +721,7 @@ def test_laya_finetuned_model_used_after_training(app_project, tmpdir, monkeypat
     corpus = _make_corpus(
         tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
     backend.suggest([Document(text="this is some text")])
 
     _, _, kwargs = backend._router.calls[0]
@@ -712,7 +738,7 @@ def test_laya_explicit_model_param_overrides_finetuned(
     corpus = _make_corpus(
         tmpdir, app_project, ["dummy text\thttp://example.org/dummy\n"]
     )
-    backend.train(corpus)
+    backend.train(corpus, jobs=1)
     backend.suggest([Document(text="this is some text")])
 
     _, _, kwargs = backend._router.calls[0]
@@ -807,7 +833,7 @@ def _merge_two_sources(backend, app_project, router, config_params=None):
 
 
 def test_laya_source_weights_off_by_default_sends_no_noul(app_project):
-    # with the default source_weights=config no noul questions are sent,
+    # with the default source_weights=false no noul questions are sent,
     # only the choice question
     backend = _make_backend(
         app_project,
@@ -824,7 +850,7 @@ def test_laya_source_weights_off_by_default_sends_no_noul(app_project):
 def test_laya_source_weights_sends_one_noul_question_per_source(app_project):
     backend = _make_backend(
         app_project,
-        config_params={"sources": "dummy-en,dummy-private", "source_weights": "laya"},
+        config_params={"sources": "dummy-en,dummy-private", "source_weights": True},
         router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
     )
     backend.suggest([Document(text="this is some text")])
@@ -852,7 +878,7 @@ def test_laya_source_question_template_placeholders(app_project):
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
             "source_question_template": "Topic {name} ({id})?",
         },
         router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
@@ -874,7 +900,7 @@ def test_laya_per_document_weights_change_the_merge(app_project):
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
             "source_laya_weight": 1.0,
         },
     )
@@ -895,7 +921,7 @@ def test_laya_source_laya_weight_blends_with_config_weight(app_project):
         app_project,
         config_params={
             "sources": "dummy-en:0.75,dummy-private:0.25",
-            "source_weights": "laya",
+            "source_weights": True,
             "source_laya_weight": 0.5,
         },
     )
@@ -916,7 +942,7 @@ def test_laya_missing_noul_answer_uses_config_weight(app_project):
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
             "source_laya_weight": 1.0,
         },
     )
@@ -935,7 +961,7 @@ def test_laya_source_top_k_drops_low_weight_sources(app_project):
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
             "source_laya_weight": 1.0,
             "source_top_k": 1,
         },
@@ -955,7 +981,7 @@ def test_laya_source_top_k_keeps_all_when_k_covers_sources(app_project):
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
             "source_laya_weight": 1.0,
             "source_top_k": 2,
         },
@@ -977,7 +1003,7 @@ def test_laya_source_weighting_failure_falls_back_to_config_weights(app_project)
         app_project,
         config_params={
             "sources": "dummy-en:0.9,dummy-private:0.1",
-            "source_weights": "laya",
+            "source_weights": True,
             "source_top_k": 1,
         },
     )
@@ -1006,12 +1032,12 @@ def test_laya_weight_zero_skips_the_choice_pass(app_project):
 
 
 def test_laya_moe_only_sends_noul_but_no_choice(app_project):
-    # source_weights=laya + laya_weight=0.0: only the noul pass runs
+    # source_weights=true + laya_weight=0.0: only the noul pass runs
     backend = _make_backend(
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
             "laya_weight": 0.0,
         },
         router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
@@ -1032,7 +1058,7 @@ def test_laya_single_source_skips_the_noul_pass(app_project):
     # with one source there is nothing to weigh: no noul questions
     backend = _make_backend(
         app_project,
-        config_params={"source_weights": "laya"},
+        config_params={"source_weights": True},
         router=NoulRouter({"dummy-en": 0.9}),
     )
     backend.suggest([Document(text="this is some text")])
@@ -1043,7 +1069,7 @@ def test_laya_single_source_skips_the_noul_pass(app_project):
 
 
 def test_laya_hyperopt_tunes_source_weight_too(app_project, tmpdir):
-    # with source_weights=laya the optimizer samples source_laya_weight
+    # with source_weights=true the optimizer samples source_laya_weight
     # next to laya_weight and recommends two config lines
     from annif.corpus import DocumentFileTSV
 
@@ -1059,7 +1085,7 @@ def test_laya_hyperopt_tunes_source_weight_too(app_project, tmpdir):
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": "laya",
+            "source_weights": True,
             "threshold": 0.75,
         },
         router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}, probability=0.9),

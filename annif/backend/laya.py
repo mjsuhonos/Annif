@@ -11,7 +11,7 @@ zero-shot by default; ``annif train`` can fine-tune the checkpoint on a
 labeled corpus with Laya's own training recipe (``laya.train``), after
 which the fine-tuned checkpoint is used automatically.
 
-With ``source_weights=laya`` the merge itself is re-weighted per
+With ``source_weights=true`` the merge itself is re-weighted per
 document (MoE-style): Laya is asked one "noul" question per source
 ("Is the document about NAME?") and each answer's P(true) becomes that
 source's weight for the document - optionally blended with the static
@@ -57,6 +57,7 @@ Chinese	zh
 
 from __future__ import annotations
 
+import copy
 import json
 import os.path
 import time
@@ -66,6 +67,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 import annif.eval
+import annif.parallel
 import annif.util
 from annif.exception import (
     NotInitializedException,
@@ -87,7 +89,7 @@ if TYPE_CHECKING:
 
 class LayaHPObjective(hyperopt.HPObjective):
     """Objective of the laya hyperparameter optimizer: samples
-    laya_weight (and, when source_weights=laya, source_laya_weight) and
+    laya_weight (and, when source_weights=true, source_laya_weight) and
     re-combines the Laya answers cached by _prepare() exactly like the
     backend does at suggest time - at the configured limit and
     threshold - so trials need no model inference. With per-document
@@ -165,7 +167,7 @@ class LayaHPObjective(hyperopt.HPObjective):
 
 class LayaOptimizer(hyperopt.HyperparameterOptimizer):
     """Hyperparameter optimizer for the laya backend: selects
-    laya_weight (and source_laya_weight when source_weights=laya) for a
+    laya_weight (and source_laya_weight when source_weights=true) for a
     labeled corpus, at the limit and threshold configured in the
     project. _prepare() runs the source merge and the Laya questions
     once; the trials re-combine the cached answers, so any number of
@@ -241,10 +243,60 @@ class LayaOptimizer(hyperopt.HyperparameterOptimizer):
         return hyperopt.HPRecommendation(lines=lines, score=study.best_value)
 
 
+class TrainDataWorker(annif.parallel.BaseWorker):
+    """Builds fine-tuning rows for document batches in parallel workers.
+
+    args = (backend, sources, params, use_weights). Each worker
+    initializes only the source projects — no Laya model is loaded,
+    because training-data generation uses the static merge and derives
+    the noul gold from the source batches, never from Laya."""
+
+    @classmethod
+    def init(cls, args) -> None:
+        super().init(args)
+        backend, sources, _params, _use = args
+        for source_id, _ in sources:
+            backend.project.registry.get_project(source_id).initialize()
+
+    @classmethod
+    def process_batch(cls, doc_batch):
+        backend, sources, params, use_weights = cls.args
+        docs = list(doc_batch)
+        batch_by_source = backend._suggest_with_sources(docs, sources)
+        # static pool on purpose: maximal gold coverage, no stock-routing
+        # bias (see _write_train_data)
+        merged = backend._merge_source_batches(batch_by_source, sources, params)
+        noul_questions = None
+        aligned_by_source = None
+        if use_weights:
+            noul_questions = backend._source_noul_questions(sources, params)
+            aligned_by_source = {
+                source_id: backend._align_batch(batch_by_source[source_id], source_id)
+                for source_id, _ in sources
+            }
+        rows = []
+        skipped = 0
+        for doc_index, (doc, result) in enumerate(zip(docs, merged)):
+            row = backend._train_row(
+                doc,
+                doc_index,
+                result,
+                sources,
+                params,
+                noul_questions,
+                aligned_by_source,
+            )
+            if row is None:
+                skipped += 1
+            else:
+                rows.append(json.dumps(row, ensure_ascii=False))
+        return rows, skipped
+
+
 class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
     """Ensemble backend that re-scores merged suggestions with Laya by
     asking one choice question whose options are the suggested
-    subjects. With source_weights=laya the source merge itself is
+    subjects. With source_weights=true the source merge itself is
     weighted per document by Laya noul answers (see _merge_for_documents).
     Without training the pipeline is zero-shot; annif train fine-tunes
     the checkpoint on a labeled corpus."""
@@ -272,10 +324,10 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         "laya_model": "multilingual",
         # cap on the raw text sent to Laya (tokenizer savings)
         "laya_input_chars": 0,
-        # per-document source weighting (MoE-style): with "laya", ask
-        # one noul question per source and use the answers as the
-        # per-document merge weights; "config" keeps the static weights
-        "source_weights": "config",
+        # per-document source weighting (MoE-style): when true, ask one
+        # noul question per source and use the answers as the per-document
+        # merge weights; when false (default), keep the static weights
+        "source_weights": False,
         # instruction of the per-source noul questions; {name} is the
         # source project's name (falling back to its id), {id} the id
         "source_question_template": "Is the document about {name}?",
@@ -563,10 +615,13 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         self, sources: list[tuple[str, float]], params: dict[str, Any]
     ) -> bool:
         """Whether per-document Laya source weighting applies: enabled
-        with source_weights=laya and meaningful only with more than one
+        with source_weights=true and meaningful only with more than one
         source (a single source's weight always normalizes to 1)."""
 
-        return params.get("source_weights", "config") == "laya" and len(sources) >= 2
+        return (
+            annif.util.boolean(params.get("source_weights", False))
+            and len(sources) >= 2
+        )
 
     def _merge_for_documents(
         self,
@@ -576,7 +631,7 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         params: dict[str, Any],
     ) -> SuggestionBatch:
         """Merge the source batches, using per-document Laya weights when
-        source_weights=laya and there is more than one source to weigh;
+        source_weights=true and there is more than one source to weigh;
         otherwise the plain static merge of the ensemble backend."""
 
         if not self._use_source_weights(sources, params):
@@ -789,6 +844,7 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         self,
         corpus: DocumentCorpus,
         params: dict[str, Any],
+        jobs: int = 1,
     ) -> None:
         """Write the Laya fine-tuning data for the corpus: a JSONL file
         of {state, questions, gold} rows, one row per document whose
@@ -801,52 +857,42 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         When per-document source weighting is enabled, each row also
         carries the per-source noul questions with derived gold, so the
         fine-tuned checkpoint learns the routing it will be asked to do
-        (see _train_row)."""
+        (see _train_row).
+
+        Rows are built per document batch in parallel workers (jobs; 0 =
+        all CPUs) via TrainDataWorker. The workers need no Laya model:
+        the merge is static and the noul gold comes from the source
+        batches, so only the source projects are initialized there."""
 
         sources = annif.util.parse_sources(params["sources"])
         for project_id, _ in sources:
             self.project.registry.get_project(project_id).initialize()
 
         use_weights = self._use_source_weights(sources, params)
-        noul_questions = (
-            self._source_noul_questions(sources, params) if use_weights else None
-        )
-
         train_path = os.path.join(self.datadir, self.TRAIN_FILE)
+        # workers never call Laya: hand them a shallow copy without the
+        # router, so process pools never pickle a loaded model, and the
+        # main-process backend keeps its router when jobs=1 (threads)
+        worker_backend = copy.copy(self)
+        worker_backend._router = None
+        worker_args = (worker_backend, sources, params, use_weights)
+
         rows = 0
         skipped = 0
+        n_jobs, pool_class = annif.parallel.get_pool(jobs)
         with open(train_path, "w", encoding="utf-8") as train_file:
-            for doc_batch in corpus.doc_batches:
-                docs = list(doc_batch)
-                batch_by_source = self._suggest_with_sources(docs, sources)
-                # static pool on purpose: maximal gold coverage, no
-                # stock-routing bias (see docstring)
-                merged = self._merge_source_batches(batch_by_source, sources, params)
-                aligned_by_source = None
-                if use_weights:
-                    aligned_by_source = {
-                        project_id: self._align_batch(
-                            batch_by_source[project_id], project_id
-                        )
-                        for project_id, _ in sources
-                    }
-                for doc_index, (doc, result) in enumerate(zip(docs, merged)):
-                    row = self._train_row(
-                        doc,
-                        doc_index,
-                        result,
-                        sources,
-                        params,
-                        noul_questions,
-                        aligned_by_source,
-                    )
-                    if row is None:
-                        # Laya cannot learn from a question whose answer
-                        # is not among the options
-                        skipped += 1
-                        continue
-                    print(json.dumps(row, ensure_ascii=False), file=train_file)
-                    rows += 1
+            with pool_class(
+                n_jobs, initializer=TrainDataWorker.init, initargs=(worker_args,)
+            ) as pool:
+                for batch_rows, batch_skipped in pool.imap_unordered(
+                    TrainDataWorker.process_batch, corpus.doc_batches
+                ):
+                    for line in batch_rows:
+                        print(line, file=train_file)
+                    rows += len(batch_rows)
+                    # Laya cannot learn from a question whose answer
+                    # is not among the options
+                    skipped += batch_skipped
         self.info(
             "wrote {} Laya fine-tuning row(s) to {}, skipped {} document(s) "
             "without a gold candidate".format(rows, train_path, skipped)
@@ -952,7 +998,8 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         params: dict[str, Any],
         jobs: int = 0,
     ) -> None:
-        # jobs is unused: fine-tuning is bound by the Laya forward and
+        # jobs parallelizes the training-data generation across document
+        # batches; the fine-tuning itself is bound by the Laya forward and
         # backward passes on one device, not by CPU parallelism
         train_path = os.path.join(self.datadir, self.TRAIN_FILE)
         if corpus != "cached":
@@ -961,7 +1008,7 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
                     "Cannot train laya project with no documents."
                 )
             self.info("preparing Laya fine-tuning data")
-            self._write_train_data(corpus, params)
+            self._write_train_data(corpus, params, jobs)
         else:
             if not os.path.exists(train_path):
                 raise NotInitializedException(
