@@ -337,6 +337,10 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         # keep only the top-K sources per document by blended weight
         # (0 or >= the number of sources: keep all)
         "source_top_k": 0,
+        # with source_top_k active: true = gate only, survivors keep their
+        # static config weight (Laya routes, the config weighs); false =
+        # survivors get the blended weight
+        "source_gate_only": False,
         # fine-tuning knobs, forwarded to laya.train (annif train
         # only); defaults are tuned for speed on large corpora, not
         # for maximum quality (see docs/laya.md)
@@ -502,7 +506,11 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         """One document's source weights: blend the noul scores with the
         static config weights (w = s * P_noul + (1 - s) * w_config, a
         missing P_noul contributes the config weight alone), then apply
-        the top-K gate keeping the source_top_k largest weights.
+        the top-K gate keeping the source_top_k largest blended weights.
+
+        With source_gate_only=true, the top-K selection is the same, but
+        survivors keep their static config weight instead of the blended
+        one (MoE gate-only: Laya routes, the config weighs).
 
         A document whose noul pass failed (all None) and a document whose
         weights would sum to zero fall back to the config weights. The
@@ -515,6 +523,9 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
             )
         )
         top_k = int(params.get("source_top_k", self.DEFAULT_PARAMETERS["source_top_k"]))
+        gate_only = annif.util.boolean(
+            params.get("source_gate_only", self.DEFAULT_PARAMETERS["source_gate_only"])
+        )
         cw = np.asarray(config_weights, dtype=np.float64)
         if all(p is None for p in noul_row):
             return cw.copy()
@@ -534,7 +545,12 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
             # then source order
             order = sorted(range(n), key=lambda i: (-weights[i], -cw[i], i))
             keep = set(order[:top_k])
-            weights = np.array([w if i in keep else 0.0 for i, w in enumerate(weights)])
+            if gate_only:
+                weights = np.array([cw[i] if i in keep else 0.0 for i in range(n)])
+            else:
+                weights = np.array(
+                    [w if i in keep else 0.0 for i, w in enumerate(weights)]
+                )
         if weights.sum() <= 0.0:
             return cw.copy()
         return weights

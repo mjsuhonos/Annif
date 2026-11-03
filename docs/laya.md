@@ -71,6 +71,7 @@ source_question_template  "Is the document about {name}?"
                                     per-source noul instruction; {name}=project name (fallback id), {id}=id
 source_laya_weight        1.0       MoE blend: w = s·P_noul + (1−s)·config weight
 source_top_k              0         keep only top-K sources per doc by blended weight (0/≥n = keep all)
+source_gate_only          false     with source_top_k: true = survivors keep config weights (gate only)
 
 annif train only (forwarded to laya.train):
 laya_epochs               1         fine-tuning epochs
@@ -102,6 +103,7 @@ is on, `source_laya_weight`; `annif optimize` tunes `threshold`.
 | `source_question_template` | instruction of the per-source noul questions; `{name}` = source project's `name` (falls back to its id), `{id}` = project id | `"Is the document about {name}?"` |
 | `source_laya_weight` | blend of the noul score with the static config weight, per source: `w = s·P_noul + (1−s)·w_config` | 1.0 |
 | `source_top_k` | keep only the top-K sources per document by blended weight (MoE-style gate); 0 or ≥ number of sources = keep all | 0 |
+| `source_gate_only` | with `source_top_k` active: `true` = gate only — survivors keep their static config weight (Laya routes, the config weighs); `false` = survivors get the blended weight | `false` |
 | `laya_epochs` | fine-tuning epochs (`annif train` only) | 1 |
 | `laya_loss` | fine-tuning objective: `rlcd` or `soft-ce` | `soft-ce` |
 | `laya_micro_batch` / `laya_grad_accum` | fine-tuning batch shape; their product is the effective batch (the notebook's is 64) | 16 / 4 |
@@ -160,6 +162,14 @@ against each other per document and is therefore independent of the
 checkpoint's probability calibration (the shipped checkpoints are
 over-confident — see "Measured results"). `source_top_k=1` is pure
 winner-take-all routing per document.
+
+With disjoint-domain sources of equal reliability (e.g. one source per
+occupation domain, all with the default equal weights), `source_gate_only=true`
+is the right mode: Laya's noul answers select the active experts (top-K),
+but the survivors are merged with their static config weights — e.g. equal
+weights renormalized over the survivors — instead of the blended score.
+This reduces false positives by shrinking the candidate pool before the
+choice question, without letting one confident source dominate the merge.
 
 Fallbacks, mirroring the choice pass: if the noul `predict()` fails for a
 document, that document keeps the static config weights (and the top-K gate

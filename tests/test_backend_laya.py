@@ -68,6 +68,7 @@ def test_laya_default_params(app_project):
         "source_question_template": "Is the document about {name}?",
         "source_laya_weight": 1.0,
         "source_top_k": 0,
+        "source_gate_only": False,
         "laya_epochs": 1,
         "laya_loss": "soft-ce",
         "laya_micro_batch": 16,
@@ -994,6 +995,68 @@ def test_laya_source_top_k_keeps_all_when_k_covers_sources(app_project):
     none_id = app_project.subjects.by_uri("http://example.org/none")
     assert hits[dummy_id] == pytest.approx(0.9)
     assert hits[none_id] == pytest.approx(0.1)
+
+
+def test_laya_source_gate_only_keeps_config_weights_for_survivors(app_project):
+    # gate-only: top-k selects by the noul score, but survivors are weighed
+    # by their static config weights. noul favors dummy-private (0.9 vs
+    # 0.1), config weights are 0.75/0.25 -> only dummy-private survives,
+    # with its config weight renormalized to 1.0
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en:0.75,dummy-private:0.25",
+            "source_weights": True,
+            "source_laya_weight": 1.0,
+            "source_top_k": 1,
+            "source_gate_only": True,
+        },
+    )
+    hits = _merge_two_sources(
+        backend, app_project, NoulRouter({"dummy-en": 0.1, "dummy-private": 0.9})
+    )
+
+    dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
+    none_id = app_project.subjects.by_uri("http://example.org/none")
+    assert none_id in hits and hits[none_id] == pytest.approx(1.0)
+    assert dummy_id not in hits
+
+    # without gate_only the survivor would get the blended (noul) weight
+    backend_blend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en:0.75,dummy-private:0.25",
+            "source_weights": True,
+            "source_laya_weight": 1.0,
+            "source_top_k": 1,
+        },
+    )
+    hits_blend = _merge_two_sources(
+        backend_blend, app_project, NoulRouter({"dummy-en": 0.1, "dummy-private": 0.9})
+    )
+    assert hits_blend[none_id] == pytest.approx(1.0)
+
+
+def test_laya_source_gate_only_ranking_uses_blended_score(app_project):
+    # with source_laya_weight < 1 the top-k ranking still uses the blended
+    # score: s=0.5, noul 0.0/1.0, config 0.9/0.1 -> blended 0.45/0.55, so
+    # dummy-private wins the gate even though dummy-en has the higher
+    # config weight
+    backend = _make_backend(
+        app_project,
+        config_params={
+            "sources": "dummy-en:0.9,dummy-private:0.1",
+            "source_weights": True,
+            "source_laya_weight": 0.5,
+            "source_top_k": 1,
+            "source_gate_only": True,
+        },
+    )
+    weights = backend._blend_source_weights(
+        [0.0, 1.0], [0.9, 0.1], backend._get_backend_params(None)
+    )
+    assert weights[0] == 0.0
+    assert weights[1] == pytest.approx(0.1)
 
 
 def test_laya_source_weighting_failure_falls_back_to_config_weights(app_project):
