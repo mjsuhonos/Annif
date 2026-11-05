@@ -275,11 +275,9 @@ def parse_metadata(metadata: tuple[str, ...] | tuple[()]) -> dict[str, str]:
     return metadata_dict
 
 
-def generate_filter_params(
-    filter_batch_max_limit: int, steps: float = 0.05
-) -> list[tuple[int, float]]:
+def generate_filter_params(filter_batch_max_limit: int) -> list[tuple[int, float]]:
     limits = range(1, filter_batch_max_limit + 1)
-    thresholds = [i * steps for i in range(round(1 / steps))]
+    thresholds = [i * 0.05 for i in range(20)]
     return list(itertools.product(limits, thresholds))
 
 
@@ -299,7 +297,8 @@ def pareto_front(
         recall = results["Recall (doc avg)"]
         if (precision, recall) in seen:
             continue
-        dominated = any(
+        seen.add((precision, recall))
+        if not any(
             other["Precision (doc avg)"] >= precision
             and other["Recall (doc avg)"] >= recall
             and (
@@ -307,9 +306,7 @@ def pareto_front(
                 or other["Recall (doc avg)"] > recall
             )
             for _, _, other in combinations
-        )
-        if not dominated:
-            seen.add((precision, recall))
+        ):
             front.append(
                 (limit, threshold, precision, recall, results["F1 score (doc avg)"])
             )
