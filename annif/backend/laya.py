@@ -288,25 +288,37 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
 
     def initialize(self, parallel: bool = False) -> None:
         super().initialize(parallel)
-        if self._router is None:
-            self.info("loading Laya decision model (downloads checkpoint on first use)")
-            try:
-                # imported lazily so Annif runs without the package
-                from laya import Router
-            except ImportError as err:
-                raise OperationFailedException(
-                    "Laya package not available, cannot use laya backend"
-                ) from err
-            self._router = Router()
-            self.info("Laya decision model loaded")
-            finetuned = self._finetuned_model_dir
-            if finetuned is not None:
-                self._router.register(
-                    self.FINETUNED_MODEL,
-                    finetuned,
-                    description="checkpoint fine-tuned by annif train",
-                )
-                self.info("using fine-tuned Laya checkpoint {}".format(finetuned))
+        if parallel:
+            # defer loading the Laya model: with a process pool, rescoring
+            # happens in the workers, so the main process never needs it
+            return
+        self._ensure_router(self.params)
+
+    def _ensure_router(self, params: dict[str, Any]) -> None:
+        """Load the Laya decision model on first use, so that parallel
+        initialization (and the main process of a pooled run) does not pay
+        for the checkpoint unless rescoring actually happens here."""
+        if self._router is not None:
+            return
+        self.info("loading Laya decision model (downloads checkpoint on first use)")
+        try:
+            # imported lazily so Annif runs without the package
+            from laya import Router
+        except ImportError as err:
+            raise OperationFailedException(
+                "Laya package not available, cannot use laya backend"
+            ) from err
+        device = params.get("laya_device", self.DEFAULT_PARAMETERS["laya_device"])
+        self._router = Router(device=None if device == "auto" else device)
+        self.info("Laya decision model loaded")
+        finetuned = self._finetuned_model_dir
+        if finetuned is not None:
+            self._router.register(
+                self.FINETUNED_MODEL,
+                finetuned,
+                description="checkpoint fine-tuned by annif train",
+            )
+            self.info("using fine-tuned Laya checkpoint {}".format(finetuned))
 
     def _subject_label(self, subject: Subject) -> str:
         """Best available label for a subject: the vocabulary language
@@ -555,6 +567,7 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
 
         if not self._use_source_weights(sources, params):
             return self._merge_source_batches(batch_by_source, sources, params)
+        self._ensure_router(params)
         merged, _, _ = self._weighted_source_merge(
             documents, batch_by_source, sources, params
         )
@@ -610,6 +623,7 @@ class LayaBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
         document); the hyperparameter optimizer reuses it to cache the
         answers once for all its trials."""
 
+        self._ensure_router(params)
         input_chars = int(params.get("laya_input_chars", 0))
         predict_kwargs = self._predict_kwargs(params)
 

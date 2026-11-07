@@ -78,7 +78,7 @@ laya_micro_batch          16        fine-tuning micro batch size
 laya_grad_accum           4         gradient accumulation steps (× micro_batch = effective batch)
 laya_shuffle_options      false     shuffle choice options each epoch
 laya_freeze_encoder       false     train only the decision head
-laya_device               "auto"    fine-tuning device (auto|cpu|cuda|...)
+laya_device               "auto"    Laya device for suggest-time inference and fine-tuning (auto|cpu|mps|cuda|...)
 ```
 
 Notes: `limit` caps subjects, `source_top_k` caps sources per document;
@@ -104,7 +104,7 @@ with `source_weights=true` each document costs two Laya forward passes
 | `laya_micro_batch` / `laya_grad_accum` | fine-tuning batch shape; their product is the effective batch (the notebook's is 64) | 16 / 4 |
 | `laya_freeze_encoder` | train only the decision head, keep the encoder frozen (faster, less adaptable) | false |
 | `laya_shuffle_options` | shuffle choice options each epoch during fine-tuning (breaks position priors) | false |
-| `laya_device` | device for fine-tuning (`auto`, `cpu`, `cuda`, …) | `auto` |
+| `laya_device` | device for Laya inference at suggest time and for fine-tuning (`auto`, `cpu`, `mps`, `cuda`, …) | `auto` |
 
 ### `limit` — the option pool
 
@@ -277,6 +277,10 @@ Notes:
   on one device (`laya_device`, default `auto`). The workers need no
   Laya model: the merge is static and the noul gold is derived from the
   source batches.
+- At suggest/eval time with `-j N`, the router is loaded lazily on first
+  rescore in each worker process; the main process skips loading it
+  entirely when initialized with `parallel=True`. Set `laya_device`
+  (e.g. `mps` on Apple Silicon) to choose the inference device.
 - **MPS workaround.** Upstream laya (0.3.29, 0.4.18) runs its pre-training
   calibration forward before moving the model to the target device, so
   on Apple Silicon with multi-question training rows (i.e.
