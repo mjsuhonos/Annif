@@ -64,9 +64,7 @@ def test_laya_default_params(app_project):
         "threshold": 0.0,
         "laya_model": "multilingual",
         "laya_input_chars": 0,
-        "source_weights": False,
-        "source_question_template": "Is the document about {name}?",
-        "source_top_k": 0,
+        "source_limit": 0,
         "laya_epochs": 1,
         "laya_loss": "soft-ce",
         "laya_micro_batch": 16,
@@ -491,11 +489,11 @@ def test_laya_train_cached_without_train_data_not_initialized(
     assert calls == []
 
 
-def test_laya_train_multi_source_includes_noul_questions(
+def test_laya_train_multi_source_includes_source_choice_question(
     app_project, tmpdir, monkeypatch
 ):
-    # with source_weights=true and two sources, each training row also
-    # carries the per-source noul questions with derived gold, and the
+    # with source_limit>0 and two sources, each training row also
+    # carries the source choice question with derived gold, and the
     # training-data generation does not call Laya at all (the pool is
     # the static merge)
     calls = []
@@ -506,7 +504,7 @@ def test_laya_train_multi_source_includes_noul_questions(
         calls,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": True,
+            "source_limit": 1,
         },
     )
     corpus = _make_corpus(
@@ -525,29 +523,25 @@ def test_laya_train_multi_source_includes_noul_questions(
     rows = _read_train_rows(backend)
     assert len(rows) == 2
     for row in rows:
-        assert set(row["questions"]) == {"the_subject", "dummy-en", "dummy-private"}
+        assert set(row["questions"]) == {"the_subject", "the_source"}
         assert row["questions"]["the_subject"]["type"] == "choice"
-        assert row["questions"]["dummy-en"] == {
-            "type": "noul",
-            "instructions": "Is the document about Dummy English?",
-        }
-        assert row["questions"]["dummy-private"] == {
-            "type": "noul",
-            "instructions": "Is the document about Dummy private project?",
+        assert row["questions"]["the_source"] == {
+            "type": "choice",
+            "instructions": "What is the text about?",
+            "criteria": {"Dummy English": "", "Dummy private project": ""},
         }
         # both dummy sources suggest the gold subject 'dummy'
         assert row["gold"]["the_subject"]["probabilities"] == {"dummy": 1.0}
-        assert row["gold"]["dummy-en"]["probabilities"] == {"false": 0.0, "true": 1.0}
-        assert row["gold"]["dummy-private"]["probabilities"] == {
-            "false": 0.0,
-            "true": 1.0,
+        assert row["gold"]["the_source"]["probabilities"] == {
+            "Dummy English": 1.0,
+            "Dummy private project": 1.0,
         }
 
 
-def test_laya_train_multi_source_without_laya_weights_is_choice_only(
+def test_laya_train_multi_source_without_source_limit_is_choice_only(
     app_project, tmpdir, monkeypatch
 ):
-    # with the default source_weights=false, training rows carry only
+    # with the default source_limit=0, training rows carry only
     # the choice question even with two sources
     calls = []
     backend = _trained_backend(
@@ -568,21 +562,21 @@ def test_laya_train_multi_source_without_laya_weights_is_choice_only(
     assert set(rows[0]["gold"]) == {"the_subject"}
 
 
-def test_laya_train_row_noul_gold_comes_from_source_hits(app_project):
+def test_laya_train_row_source_gold_comes_from_source_hits(app_project):
     # unit test of _train_row: dummy-en suggests the gold subject,
-    # dummy-private suggests a non-gold one -> noul gold 1.0 vs 0.0
+    # dummy-private suggests a non-gold one -> source gold 1.0 vs 0.0
     from annif.corpus.types import SubjectSet
 
     backend = _make_backend(
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": True,
+            "source_limit": 1,
         },
     )
     params = backend._get_backend_params(None)
     sources = annif.util.parse_sources(params["sources"])
-    noul_questions = backend._source_noul_questions(sources, params)
+    source_questions, source_labels = backend._source_choice_questions(sources, params)
 
     dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
     none_id = app_project.subjects.by_uri("http://example.org/none")
@@ -593,18 +587,34 @@ def test_laya_train_row_noul_gold_comes_from_source_hits(app_project):
     doc = Document(text="some text", subject_set=SubjectSet([dummy_id]))
 
     row = backend._train_row(
-        doc, 0, merged[0], sources, params, noul_questions, aligned_by_source
+        doc,
+        0,
+        merged[0],
+        sources,
+        params,
+        source_questions,
+        source_labels,
+        aligned_by_source,
     )
-    assert set(row["questions"]) == {"the_subject", "dummy-en", "dummy-private"}
+    assert set(row["questions"]) == {"the_subject", "the_source"}
     assert row["gold"]["the_subject"]["probabilities"] == {"dummy": 1.0}
-    assert row["gold"]["dummy-en"]["probabilities"] == {"false": 0.0, "true": 1.0}
-    assert row["gold"]["dummy-private"]["probabilities"] == {"false": 0.0, "true": 0.0}
+    assert row["gold"]["the_source"]["probabilities"] == {
+        "Dummy English": 1.0,
+        "Dummy private project": 0.0,
+    }
 
     # a document whose gold is not among the candidates yields no row
     doc_none = Document(text="other text", subject_set=SubjectSet([none_id]))
     assert (
         backend._train_row(
-            doc_none, 0, merged[0], sources, params, noul_questions, aligned_by_source
+            doc_none,
+            0,
+            merged[0],
+            sources,
+            params,
+            source_questions,
+            source_labels,
+            aligned_by_source,
         )
         is None
     )
@@ -774,26 +784,32 @@ class MapRouter(FakeRouter):
         }
 
 
-class NoulRouter(FakeRouter):
-    """FakeRouter variant that also answers the per-source noul
-    questions, with a fixed P(true) per question id. A qid missing from
-    noul_probs simulates an answer that lacks that question; fail_noul
-    simulates the whole noul pass raising."""
+class SourceRouter(FakeRouter):
+    """FakeRouter variant that also answers the source choice question
+    ("the_source"), with a fixed probability per option label. A label
+    missing from source_probs simulates an answer that lacks that option;
+    fail_source simulates the whole source pass raising."""
 
-    def __init__(self, noul_probs=None, probability=0.5, fail_noul=False):
+    def __init__(self, source_probs=None, probability=0.5, fail_source=False):
         super().__init__(probability=probability)
-        self.noul_probs = noul_probs or {}
-        self.fail_noul = fail_noul
+        self.source_probs = source_probs or {}
+        self.fail_source = fail_source
 
     def predict(self, state, questions, **kwargs):
         self.calls.append((state, questions, kwargs))
-        if self.fail_noul and any(q["type"] == "noul" for q in questions.values()):
-            raise RuntimeError("fake Laya noul failure")
+        if self.fail_source and "the_source" in questions:
+            raise RuntimeError("fake Laya source failure")
         answers = {}
         for qid, question in questions.items():
-            if question["type"] == "noul":
-                if qid in self.noul_probs:
-                    answers[qid] = {"type": "noul", "noul": self.noul_probs[qid]}
+            if qid == "the_source":
+                options = list(question["criteria"])
+                answers[qid] = {
+                    "type": "choice",
+                    "choice": options[0],
+                    "probabilities": {
+                        o: self.source_probs.get(o, 0.0) for o in options
+                    },
+                }
             else:
                 options = list(question["criteria"])
                 answers[qid] = {
@@ -831,13 +847,13 @@ def _merge_two_sources(backend, app_project, router, config_params=None):
     return {s.subject_id: s.score for s in merged[0]}
 
 
-def test_laya_source_weights_off_by_default_sends_no_noul(app_project):
-    # with the default source_weights=false no noul questions are sent,
-    # only the choice question
+def test_laya_source_limit_off_by_default_sends_no_source_question(app_project):
+    # with the default source_limit=0 no source question is sent,
+    # only the re-ranking choice question
     backend = _make_backend(
         app_project,
         config_params={"sources": "dummy-en,dummy-private"},
-        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
+        router=SourceRouter({"Dummy English": 0.9, "Dummy private project": 0.1}),
     )
     backend.suggest([Document(text="this is some text")])
 
@@ -846,64 +862,44 @@ def test_laya_source_weights_off_by_default_sends_no_noul(app_project):
     assert list(questions) == ["the_subject"]
 
 
-def test_laya_source_weights_sends_one_noul_question_per_source(app_project):
+def test_laya_source_limit_sends_one_choice_question_over_sources(app_project):
     backend = _make_backend(
         app_project,
-        config_params={"sources": "dummy-en,dummy-private", "source_weights": True},
-        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
+        config_params={"sources": "dummy-en,dummy-private", "source_limit": 1},
+        router=SourceRouter({"Dummy English": 0.9, "Dummy private project": 0.1}),
     )
     backend.suggest([Document(text="this is some text")])
 
-    # first call: the noul questions, keyed by project id, using the
-    # projects' names; second call: the choice question
+    # first call: the source choice question (same template as the
+    # re-ranking question, options = project names); second call: the
+    # re-ranking choice question
     assert len(backend._router.calls) == 2
     _, questions, _ = backend._router.calls[0]
     assert questions == {
-        "dummy-en": {
-            "type": "noul",
-            "instructions": "Is the document about Dummy English?",
-        },
-        "dummy-private": {
-            "type": "noul",
-            "instructions": "Is the document about Dummy private project?",
-        },
+        "the_source": {
+            "type": "choice",
+            "instructions": "What is the text about?",
+            "criteria": {"Dummy English": "", "Dummy private project": ""},
+        }
     }
     _, choice_questions, _ = backend._router.calls[1]
     assert list(choice_questions) == ["the_subject"]
 
 
-def test_laya_source_question_template_placeholders(app_project):
-    backend = _make_backend(
-        app_project,
-        config_params={
-            "sources": "dummy-en,dummy-private",
-            "source_weights": True,
-            "source_question_template": "Topic {name} ({id})?",
-        },
-        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
-    )
-    backend.suggest([Document(text="this is some text")])
-
-    _, questions, _ = backend._router.calls[0]
-    assert questions["dummy-en"]["instructions"] == "Topic Dummy English (dummy-en)?"
-    assert (
-        questions["dummy-private"]["instructions"]
-        == "Topic Dummy private project (dummy-private)?"
-    )
-
-
 def test_laya_source_gate_off_keeps_static_merge(app_project):
-    # source_weights=true but source_top_k=0: the noul answers are computed
-    # but change nothing - the merge keeps the static config weights
+    # source_limit>0 but >= number of sources: the source answers are
+    # computed but change nothing - the merge keeps the static config weights
     backend = _make_backend(
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": True,
+            "source_limit": 5,
         },
     )
     hits = _merge_two_sources(
-        backend, app_project, NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1})
+        backend,
+        app_project,
+        SourceRouter({"Dummy English": 0.9, "Dummy private project": 0.1}),
     )
 
     dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
@@ -912,19 +908,21 @@ def test_laya_source_gate_off_keeps_static_merge(app_project):
     assert hits[none_id] == pytest.approx(0.5)
 
 
-def test_laya_source_top_k_drops_low_noul_sources(app_project):
-    # top_k=1 ranked by noul: dummy-private (0.9) beats dummy-en (0.1), so
-    # only dummy-private survives, with its config weight renormalized
+def test_laya_source_limit_drops_low_scoring_sources(app_project):
+    # source_limit=1 ranked by the source-choice probabilities:
+    # Dummy private project (0.9) beats Dummy English (0.1), so only
+    # dummy-private survives, with its config weight renormalized
     backend = _make_backend(
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": True,
-            "source_top_k": 1,
+            "source_limit": 1,
         },
     )
     hits = _merge_two_sources(
-        backend, app_project, NoulRouter({"dummy-en": 0.1, "dummy-private": 0.9})
+        backend,
+        app_project,
+        SourceRouter({"Dummy English": 0.1, "Dummy private project": 0.9}),
     )
 
     dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
@@ -933,19 +931,20 @@ def test_laya_source_top_k_drops_low_noul_sources(app_project):
     assert dummy_id not in hits
 
 
-def test_laya_source_top_k_keeps_config_weights_for_survivors(app_project):
-    # top_k=2 keeps both; survivors keep their static config weights
-    # 0.75/0.25 regardless of the noul answers
+def test_laya_source_limit_keeps_config_weights_for_survivors(app_project):
+    # source_limit=2 keeps both; survivors keep their static config weights
+    # 0.75/0.25 regardless of the source answers
     backend = _make_backend(
         app_project,
         config_params={
             "sources": "dummy-en:0.75,dummy-private:0.25",
-            "source_weights": True,
-            "source_top_k": 2,
+            "source_limit": 2,
         },
     )
     hits = _merge_two_sources(
-        backend, app_project, NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1})
+        backend,
+        app_project,
+        SourceRouter({"Dummy English": 0.9, "Dummy private project": 0.1}),
     )
 
     dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
@@ -954,18 +953,20 @@ def test_laya_source_top_k_keeps_config_weights_for_survivors(app_project):
     assert hits[none_id] == pytest.approx(0.25)
 
 
-def test_laya_missing_noul_answer_ranks_last(app_project):
-    # an answer lacking one question ranks that source last: with top_k=1
-    # and dummy-en at 0.8, the missing dummy-private is dropped
+def test_laya_missing_source_answer_ranks_last(app_project):
+    # an answer lacking one option ranks that source last: with
+    # source_limit=1 and Dummy English at 0.8, the missing
+    # Dummy private project is dropped
     backend = _make_backend(
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": True,
-            "source_top_k": 1,
+            "source_limit": 1,
         },
     )
-    hits = _merge_two_sources(backend, app_project, NoulRouter({"dummy-en": 0.8}))
+    hits = _merge_two_sources(
+        backend, app_project, SourceRouter({"Dummy English": 0.8})
+    )
 
     dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
     none_id = app_project.subjects.by_uri("http://example.org/none")
@@ -974,17 +975,16 @@ def test_laya_missing_noul_answer_ranks_last(app_project):
 
 
 def test_laya_source_weighting_failure_falls_back_to_config_weights(app_project):
-    # a failed noul pass keeps the static config weights (and the top-K
+    # a failed source pass keeps the static config weights (and the top-K
     # gate does not apply to the fallback): config 0.9/0.1
     backend = _make_backend(
         app_project,
         config_params={
             "sources": "dummy-en:0.9,dummy-private:0.1",
-            "source_weights": True,
-            "source_top_k": 1,
+            "source_limit": 1,
         },
     )
-    hits = _merge_two_sources(backend, app_project, NoulRouter(fail_noul=True))
+    hits = _merge_two_sources(backend, app_project, SourceRouter(fail_source=True))
 
     dummy_id = app_project.subjects.by_uri("http://example.org/dummy")
     none_id = app_project.subjects.by_uri("http://example.org/none")
@@ -993,8 +993,8 @@ def test_laya_source_weighting_failure_falls_back_to_config_weights(app_project)
 
 
 def test_laya_weight_zero_skips_the_choice_pass(app_project):
-    # laya_weight=0.0: no choice question is sent at all, the output is
-    # the merged source score as-is
+    # laya_weight=0.0: no re-ranking choice question is sent at all, the
+    # output is the merged source score as-is
     backend = _make_backend(
         app_project,
         config_params={"laya_weight": 0.0},
@@ -1008,35 +1008,35 @@ def test_laya_weight_zero_skips_the_choice_pass(app_project):
     assert hits[0].score == pytest.approx(1.0)
 
 
-def test_laya_moe_only_sends_noul_but_no_choice(app_project):
-    # source_weights=true + laya_weight=0.0: only the noul pass runs
+def test_laya_moe_only_sends_source_question_but_no_choice(app_project):
+    # source_limit>0 + laya_weight=0.0: only the source choice pass runs
     backend = _make_backend(
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": True,
+            "source_limit": 1,
             "laya_weight": 0.0,
         },
-        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}),
+        router=SourceRouter({"Dummy English": 0.9, "Dummy private project": 0.1}),
     )
     result = backend.suggest([Document(text="this is some text")])[0]
 
     assert len(backend._router.calls) == 1
     _, questions, _ = backend._router.calls[0]
-    assert set(questions) == {"dummy-en", "dummy-private"}
-    assert all(q["type"] == "noul" for q in questions.values())
+    assert list(questions) == ["the_source"]
+    assert questions["the_source"]["type"] == "choice"
     hits = list(result)
     assert len(hits) == 1
     assert hits[0].subject_id == app_project.subjects.by_uri("http://example.org/dummy")
     assert hits[0].score == pytest.approx(1.0)
 
 
-def test_laya_single_source_skips_the_noul_pass(app_project):
-    # with one source there is nothing to weigh: no noul questions
+def test_laya_single_source_skips_the_source_pass(app_project):
+    # with one source there is nothing to gate: no source question
     backend = _make_backend(
         app_project,
-        config_params={"source_weights": True},
-        router=NoulRouter({"dummy-en": 0.9}),
+        config_params={"source_limit": 1},
+        router=SourceRouter({"Dummy English": 0.9}),
     )
     backend.suggest([Document(text="this is some text")])
 
@@ -1046,7 +1046,7 @@ def test_laya_single_source_skips_the_noul_pass(app_project):
 
 
 def test_laya_hyperopt_with_source_gating(app_project, tmpdir):
-    # with source_weights=true the prepare pass runs the noul gate, but the
+    # with source_limit>0 the prepare pass runs the source gate, but the
     # optimizer still tunes only laya_weight and recommends a single line
     from annif.corpus import DocumentFileTSV
 
@@ -1062,11 +1062,12 @@ def test_laya_hyperopt_with_source_gating(app_project, tmpdir):
         app_project,
         config_params={
             "sources": "dummy-en,dummy-private",
-            "source_weights": True,
-            "source_top_k": 1,
+            "source_limit": 1,
             "threshold": 0.75,
         },
-        router=NoulRouter({"dummy-en": 0.9, "dummy-private": 0.1}, probability=0.9),
+        router=SourceRouter(
+            {"Dummy English": 0.9, "Dummy private project": 0.1}, probability=0.9
+        ),
     )
     optimizer = backend.get_hp_optimizer(corpus, "F1 score (doc avg)")
 
