@@ -141,7 +141,9 @@ class HyperparameterOptimizer:
         study = optuna.create_study(direction="maximize", storage=storage_url)
 
         jobs, pool_class = annif.parallel.get_pool(n_jobs)
-        with pool_class(jobs) as pool:
+        with pool_class(
+            jobs, initializer=self._objective.init, initargs=(objective_args,)
+        ) as pool:
             for i in range(n_trials):
                 pool.apply_async(
                     self._objective.run_trial,
