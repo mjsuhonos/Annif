@@ -5,7 +5,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import annif
 import annif.backend.dummy
+import annif.default_config
 import annif.project
 from annif.corpus import Document
 from annif.exception import ConfigurationException, NotSupportedException
@@ -85,7 +87,228 @@ def test_get_project_fi_dump(registry):
         "vocab_language": "fi",
         "is_trained": True,
         "modification_time": None,
+        "metadata_fields": [],
     }
+
+
+def test_get_project_metadata_fields_select(registry):
+    # a project with a select(...) transform exposes its fields, in order, but
+    # not "text", which is not metadata and which every project supports
+    project = registry.get_project("select-meta")
+    assert project.dump()["metadata_fields"] == ["title", "description"]
+
+
+@pytest.mark.parametrize(
+    "transform, expected",
+    [
+        ("select(text)", []),
+        ("select(text,title)", ["title"]),
+        ("select(title,text,description)", ["title", "description"]),
+    ],
+)
+def test_get_project_metadata_fields_leaves_out_text(
+    registry, tmp_path, transform, expected
+):
+    # "text" is not metadata and every project supports it, so it is never
+    # listed, even when a select(...) transform targets it
+    project = annif.project.AnnifProject(
+        "select-text",
+        {
+            "name": "Project selecting the text",
+            "language": "fi",
+            "backend": "dummy",
+            "vocab": "dummy",
+            "transform": transform,
+        },
+        str(tmp_path),
+        registry,
+    )
+    assert project.metadata_fields() == expected
+
+
+def test_get_project_metadata_fields_none(registry):
+    # a project without a select transform has no metadata fields
+    project = registry.get_project("dummy-fi")
+    assert project.metadata_fields() == []
+
+
+def test_get_project_metadata_fields_ensemble_union(registry):
+    # an ensemble gathers source fields in addition to its own, de-duplicated
+    # and order-preserving: own select(description) first, then the source
+    # select-meta's (title, description, text without "text"); dummy-en has no
+    # select fields
+    project = registry.get_project("ensemble-meta")
+    assert project.dump()["metadata_fields"] == ["description", "title"]
+
+
+def test_get_project_metadata_fields_nested_ensemble(registry):
+    # gathering is recursive: an ensemble whose source is itself an ensemble
+    # must also pick up the fields of that source's own sources, because
+    # suggest() recurses the same way. Own select(subtitle), then
+    # ensemble-meta's select(description), then select-meta's
+    # (title, description, text without "text"); dummy-en contributes none.
+    project = registry.get_project("ensemble-meta-nested")
+    assert project.dump()["metadata_fields"] == ["subtitle", "description", "title"]
+
+
+class CyclicSourcesConfig(annif.default_config.TestingConfig):
+    PROJECTS_CONFIG_PATH = "tests/projects_cyclic_sources.cfg"
+
+
+@pytest.mark.parametrize(
+    "project_id, expected",
+    [
+        # cyc-a has sources=cyc-b and cyc-b has sources=cyc-a: each project is
+        # visited once, so the own fields come first, then those of the source
+        ("cyc-a", ["title", "subtitle"]),
+        ("cyc-b", ["subtitle", "title"]),
+        # a project that is its own source
+        ("cyc-self", ["description"]),
+    ],
+)
+def test_get_project_metadata_fields_source_cycle(project_id, expected):
+    # a cyclic sources configuration must not cause unbounded recursion. The
+    # projects live in a separate app, so the shared fixture projects (and their
+    # counts) are unchanged.
+    cxapp = annif.create_app(config_name="tests.test_project.CyclicSourcesConfig")
+    with cxapp.app.app_context():
+        project = annif.registry.get_project(project_id)
+        assert project.metadata_fields() == expected
+
+
+def test_get_project_metadata_fields_skips_unloadable_source(registry, monkeypatch):
+    # a source project that cannot be loaded is skipped best-effort, mirroring
+    # the graceful degradation already used for vocab in dump()
+    project = registry.get_project("ensemble-meta")
+    real_get_project = project.registry.get_project
+
+    def fake_get_project(project_id, *args, **kwargs):
+        if project_id == "select-meta":
+            raise ValueError("source not loadable")
+        return real_get_project(project_id, *args, **kwargs)
+
+    monkeypatch.setattr(project.registry, "get_project", fake_get_project)
+    # only the ensemble's own select(description) field remains
+    assert project.metadata_fields() == ["description"]
+
+
+def test_get_project_metadata_fields_transform_error(registry, monkeypatch):
+    # if the transform chain cannot be resolved (misconfiguration), the project
+    # degrades to no metadata fields rather than raising
+    project = registry.get_project("dummy-fi")
+
+    class BrokenTransform:
+        @property
+        def transforms(self):
+            raise ConfigurationException("broken transform")
+
+    monkeypatch.setattr(project, "_transform", BrokenTransform())
+    assert project.metadata_fields() == []
+
+
+@pytest.mark.parametrize(
+    "sources, expected",
+    [
+        # a weight that is not a number makes parse_sources() raise a
+        # ConfigurationException: only the project's own fields remain
+        ("select-meta:x", ["description"]),
+        ("select-meta:1,dummy-fi:x", ["description"]),
+        # a zero or negative weight is valid (it is replaced by a small positive
+        # one), so the source project's fields are gathered as usual
+        ("select-meta:0", ["description", "title"]),
+        ("select-meta:1,dummy-fi:-1", ["description", "title"]),
+    ],
+)
+def test_get_project_metadata_fields_source_weights(
+    registry, tmp_path, sources, expected
+):
+    # real sources values, using source projects that exist in the fixtures
+    # (select-meta selects title, description and text; dummy-fi selects
+    # nothing). The project is built in isolation, so the shared fixture
+    # projects are unchanged.
+    project = annif.project.AnnifProject(
+        "ensemble-source-weights",
+        {
+            "name": "Ensemble with different source weights",
+            "language": "fi",
+            "backend": "ensemble",
+            "sources": sources,
+            "vocab": "dummy",
+            "transform": "select(description)",
+        },
+        str(tmp_path),
+        registry,
+    )
+    assert project.metadata_fields() == expected
+
+
+class SourceWeightsConfig(annif.default_config.TestingConfig):
+    PROJECTS_CONFIG_PATH = "tests/projects_source_weights.cfg"
+
+
+@pytest.fixture(scope="module")
+def source_weights_cxapp(cxapp):
+    # the cxapp fixture makes sure the dummy vocab is in place; the projects with
+    # different sources values live in a separate app, so that the shared
+    # fixture projects (and their counts) are unchanged
+    return annif.create_app(config_name="tests.test_project.SourceWeightsConfig")
+
+
+@pytest.mark.parametrize(
+    "project_id, weight",
+    [("weights-zero", "0"), ("weights-nan", "nan"), ("weights-inf", "inf")],
+)
+def test_project_replaced_source_weight_lists_like_default(
+    source_weights_cxapp, restore_duplicate_filters, caplog, project_id, weight
+):
+    # a source weight that is zero or not finite is replaced by a small positive
+    # one, so the project behaves like one with the default weight
+    with caplog.at_level(logging.WARNING):
+        with source_weights_cxapp.test_client() as client:
+            response = client.get("/v1/projects")
+    assert response.status_code == 200
+    assert f"weight {weight} for source 'dummy-fi'" in caplog.text
+    projects = {proj["project_id"]: proj for proj in response.json()["projects"]}
+    assert projects["weights-ref"]["is_trained"] is True
+    for key in (
+        "backend",
+        "vocab",
+        "vocab_language",
+        "is_trained",
+        "modification_time",
+    ):
+        assert projects[project_id][key] == projects["weights-ref"][key]
+
+
+@pytest.mark.parametrize("project_id", ["weights-zero", "weights-nan", "weights-inf"])
+def test_project_replaced_source_weight_suggests_like_default(
+    source_weights_cxapp, restore_duplicate_filters, project_id
+):
+    docs = [Document(text="example text")]
+    with source_weights_cxapp.app.app_context():
+        ref = annif.registry.get_project("weights-ref").suggest(docs)[0]
+        result = annif.registry.get_project(project_id).suggest(docs)[0]
+    assert len(list(ref)) > 0
+    assert list(result) == list(ref)
+
+
+def test_project_not_a_number_source_weight(
+    source_weights_cxapp, restore_duplicate_filters
+):
+    # a source weight that is not a number makes the project misconfigured: it
+    # is still listed, with an unknown train state, but suggest() raises
+    with source_weights_cxapp.test_client() as client:
+        response = client.get("/v1/projects")
+    assert response.status_code == 200
+    projects = {proj["project_id"]: proj for proj in response.json()["projects"]}
+    assert projects["weights-invalid-x"]["is_trained"] is None
+    assert projects["weights-invalid-x"]["modification_time"] is None
+
+    docs = [Document(text="example text")]
+    with source_weights_cxapp.app.app_context():
+        project = annif.registry.get_project("weights-invalid-x")
+        with pytest.raises(ConfigurationException, match="is not a number"):
+            project.suggest(docs)
 
 
 def test_get_project_nonexistent(registry):
@@ -324,6 +547,50 @@ def test_project_file_toml():
 def test_project_directory():
     cxapp = annif.create_app(config_name="annif.default_config.TestingDirectoryConfig")
     with cxapp.app.app_context():
-        assert len(annif.registry.get_projects()) == 17 + 2
+        assert len(annif.registry.get_projects()) == 20 + 2
         assert annif.registry.get_project("dummy-fi").project_id == "dummy-fi"
         assert annif.registry.get_project("dummy-fi-toml").project_id == "dummy-fi-toml"
+
+
+def test_registry_validates_missing_env_var_at_startup(tmp_path, monkeypatch):
+    # a missing environment variable must be an error when the registry
+    # is created, even if the option is never accessed
+    monkeypatch.delenv("ANNIF_TEST_MISSING", raising=False)
+    conffile = tmp_path.joinpath("projects.cfg")
+    conffile.write_text(
+        "[testproj]\n"
+        "language=en\n"
+        "name=Test\n"
+        "backend=tfidf\n"
+        "limit=${ANNIF_TEST_MISSING}\n"
+    )
+    app = annif.create_flask_app("annif.default_config.TestingConfig")
+    app.config["PROJECTS_CONFIG_PATH"] = str(conffile)
+    with app.app_context():
+        with pytest.raises(ConfigurationException) as excinfo:
+            annif.registry.initialize_projects(app)
+    message = excinfo.value.format_message()
+    assert "ANNIF_TEST_MISSING" in message
+    assert "'testproj'" in message
+    assert "'limit'" in message
+
+
+def test_registry_validates_env_var_default_section(tmp_path, monkeypatch):
+    # environment variable placeholders in the DEFAULT section are also
+    # validated at startup
+    monkeypatch.delenv("ANNIF_TEST_MISSING", raising=False)
+    conffile = tmp_path.joinpath("projects.cfg")
+    conffile.write_text(
+        "[DEFAULT]\n"
+        "limit=${ANNIF_TEST_MISSING}\n"
+        "[testproj]\n"
+        "language=en\n"
+        "name=Test\n"
+        "backend=tfidf\n"
+    )
+    app = annif.create_flask_app("annif.default_config.TestingConfig")
+    app.config["PROJECTS_CONFIG_PATH"] = str(conffile)
+    with app.app_context():
+        with pytest.raises(ConfigurationException) as excinfo:
+            annif.registry.initialize_projects(app)
+    assert "ANNIF_TEST_MISSING" in excinfo.value.format_message()

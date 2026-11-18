@@ -11,6 +11,8 @@ data
 docs/_build/
 uv.lock
 projects.cfg
+projects.toml
+projects.d/
 venv/
 .hypothesis/
 fulltext
