@@ -14,7 +14,6 @@ import annif.util
 from annif.exception import NotInitializedException, NotSupportedException
 from annif.lexical.mllm import (
     MLLMModel,
-    candidates_to_features,
     create_classifier,
     prediction_to_list,
 )
@@ -60,24 +59,17 @@ class MLLMHPObjective(hyperopt.HPObjective):
         model.fit(args["train_x"], args["train_y"])
 
         # score the candidates of all documents in a single predict_proba
-        # call, then split the probabilities per document
-        all_features = np.vstack(
-            [
-                candidates_to_features(candidates, args["model_data"])
-                for candidates in args["candidates"]
-            ]
-        )
-        proba = model.predict_proba(all_features)
+        # call; the rows of train_x are the feature values of the candidates
+        # in corpus document order, so they can be split per document by
+        # candidate counts
+        proba = model.predict_proba(args["train_x"])
 
         batch = annif.eval.EvaluationBatch(args["subject_index"])
         start = 0
         for goldsubj, candidates in zip(args["gold_subjects"], args["candidates"]):
             end = start + len(candidates.subject_ids)
-            if end > start:
-                scores = proba[start:end]
-                ranking = prediction_to_list(scores, candidates.subject_ids)
-            else:
-                ranking = []
+            scores = proba[start:end]
+            ranking = prediction_to_list(scores, candidates.subject_ids)
             results = prediction_to_result(ranking, params, args["subject_index"])
             batch.evaluate_many([results], [goldsubj])
             start = end
@@ -117,7 +109,9 @@ class MLLMOptimizer(hyperopt.HyperparameterOptimizer):
                 initializer=MLLMCandidateGenerator.init,
                 initargs=({"backend": self._backend},),
             ) as pool:
-                for candidates, subject_sets in pool.imap_unordered(
+                # ordered map: the candidate blocks must arrive in corpus
+                # order so that their rows match the train_x feature matrix
+                for candidates, subject_sets in pool.imap(
                     MLLMCandidateGenerator.generate_for_doc_batch,
                     self._corpus.doc_batches,
                 ):
