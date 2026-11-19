@@ -124,33 +124,40 @@ def candidates_to_features(
     """Convert a CandidateBlock to a NumPy feature matrix"""
 
     subject_ids = candidates.subject_ids
-    matrix = np.zeros((len(subject_ids), len(Feature)), dtype=np.float32)
+    feats = candidates.feats
+    n = len(subject_ids)
     c_ids = subject_ids.tolist()
+
+    matrix = np.zeros((n, len(Feature)), dtype=np.float32)
+
+    # copy the match-level feature columns in one go; the MatchFeature
+    # column order matches the corresponding Feature members
+    for mf in MatchFeature:
+        matrix[:, Feature[mf.name]] = feats[:, mf]
+
+    # subject-specific values: look up once per unique subject, then scatter
+    uniq, inv = np.unique(subject_ids, return_inverse=True)
+    doc_freq = np.array([mdata.doc_freq[s] for s in uniq.tolist()])
+    subj_freq = np.array([mdata.subj_freq.get(s, 1) - 1 for s in uniq.tolist()])
+    idf = np.array([mdata.idf[s] for s in uniq.tolist()])
+    matrix[:, Feature.doc_freq] = doc_freq[inv]
+    matrix[:, Feature.subj_freq] = subj_freq[inv]
+    matrix[:, Feature.tfidf] = feats[:, MatchFeature.freq] * idf[inv]
+
+    # relation features: sparse matrix operations on a vector marking the
+    # candidate subjects, then gather the rows/columns of the candidates
     c_vec = np.zeros(mdata.related.shape[0], dtype=bool)
     c_vec[c_ids] = True
-    broader = mdata.broader.multiply(c_vec).sum(axis=1)
-    narrower = mdata.narrower.multiply(c_vec).sum(axis=1)
-    related = mdata.related.multiply(c_vec).sum(axis=1)
-    collection = mdata.collection.multiply(c_vec).T.dot(mdata.collection).sum(axis=0)
-    for idx, c in enumerate(candidates.feats):
-        subj = c_ids[idx]
-        matrix[idx, Feature.freq] = c[MatchFeature.freq]
-        matrix[idx, Feature.doc_freq] = mdata.doc_freq[subj]
-        matrix[idx, Feature.subj_freq] = mdata.subj_freq.get(subj, 1) - 1
-        matrix[idx, Feature.tfidf] = (
-            c[MatchFeature.freq] * mdata.idf[subj]
-        )
-        matrix[idx, Feature.is_pref] = c[MatchFeature.is_pref]
-        matrix[idx, Feature.n_tokens] = c[MatchFeature.n_tokens]
-        matrix[idx, Feature.ambiguity] = c[MatchFeature.ambiguity]
-        matrix[idx, Feature.first_occ] = c[MatchFeature.first_occ]
-        matrix[idx, Feature.last_occ] = c[MatchFeature.last_occ]
-        matrix[idx, Feature.spread] = c[MatchFeature.spread]
-        matrix[idx, Feature.doc_length] = c[MatchFeature.doc_length]
-        matrix[idx, Feature.broader] = broader[subj, 0] / len(c_ids)
-        matrix[idx, Feature.narrower] = narrower[subj, 0] / len(c_ids)
-        matrix[idx, Feature.related] = related[subj, 0] / len(c_ids)
-        matrix[idx, Feature.collection] = collection[0, subj] / len(c_ids)
+    broader = np.asarray(mdata.broader.multiply(c_vec).sum(axis=1))
+    narrower = np.asarray(mdata.narrower.multiply(c_vec).sum(axis=1))
+    related = np.asarray(mdata.related.multiply(c_vec).sum(axis=1))
+    collection = np.asarray(
+        mdata.collection.multiply(c_vec).T.dot(mdata.collection).sum(axis=0)
+    )
+    matrix[:, Feature.broader] = broader[c_ids, 0] / n
+    matrix[:, Feature.narrower] = narrower[c_ids, 0] / n
+    matrix[:, Feature.related] = related[c_ids, 0] / n
+    matrix[:, Feature.collection] = collection[0, c_ids] / n
     return matrix
 
 
