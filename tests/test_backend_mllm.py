@@ -8,6 +8,7 @@ import annif
 import annif.backend
 import annif.parallel
 from annif.backend.mllm import MLLMCandidateGenerator
+from annif.lexical.mllm import CandidateBlock
 from annif.corpus import Document
 from annif.exception import NotInitializedException, NotSupportedException
 
@@ -143,7 +144,14 @@ def test_mllm_candidate_generator_doc_batch(project, fulltext_corpus):
     assert len(candidates) == len(doc_batch)
     assert len(subject_sets) == len(doc_batch)
     assert subject_sets == [doc.subject_set for doc in doc_batch]
-    assert all(isinstance(doc_candidates, list) for doc_candidates in candidates)
+    assert all(
+        isinstance(doc_candidates, CandidateBlock)
+        for doc_candidates in candidates
+    )
+    assert all(
+        len(candidates_.subject_ids) == len(candidates_.feats)
+        for candidates_ in candidates
+    )
     assert any(candidates)
 
 
@@ -165,9 +173,16 @@ def test_mllm_hyperopt_parallel_n_jobs_2(project, fulltext_corpus, monkeypatch):
     serial_args = optimizer._prepare(n_jobs=1)
     parallel_args = optimizer._prepare(n_jobs=2)
 
+    def cand_key(candidates):
+        """hashable representation of a candidate block for comparison"""
+        return (
+            tuple(candidates.subject_ids.tolist()),
+            tuple(candidates.feats.ravel().tolist()),
+        )
+
     def paired_results(args):
         return sorted(
-            (tuple(candidates), tuple(sorted(subjects)))
+            (cand_key(candidates), tuple(sorted(subjects)))
             for candidates, subjects in zip(args["candidates"], args["gold_subjects"])
         )
 

@@ -39,11 +39,7 @@ Term = collections.namedtuple("Term", "subject_id label is_pref")
 
 Match = collections.namedtuple("Match", "subject_id is_pref n_tokens pos ambiguity")
 
-Candidate = collections.namedtuple(
-    "Candidate",
-    "doc_length subject_id freq is_pref n_tokens ambiguity "
-    + "first_occ last_occ spread",
-)
+CandidateBlock = collections.namedtuple("CandidateBlock", "subject_ids feats")
 
 ModelData = collections.namedtuple(
     "ModelData", "broader narrower related collection " + "doc_freq subj_freq idf"
@@ -57,25 +53,43 @@ Feature = IntEnum(
     start=0,
 )
 
+# columns of the compact per-document feature block produced by
+# conflate_matches, in the same order as the corresponding Feature enum
+# members; the remaining Feature columns (doc_freq, subj_freq, tfidf,
+# broader, narrower, related, collection) are derived from the model data
+MatchFeature = IntEnum(
+    "MatchFeature",
+    "freq is_pref n_tokens ambiguity "
+    + "first_occ last_occ spread doc_length",
+    start=0,
+)
 
-def conflate_matches(matches: list[Match], doc_length: int) -> list[Candidate]:
+
+def conflate_matches(matches: list[Match], doc_length: int) -> CandidateBlock:
+    """Condense the matches for each subject into one row of a compact
+    per-document candidate block (subject IDs + match-level features)."""
     subj_matches = collections.defaultdict(list)
     for match in matches:
         subj_matches[match.subject_id].append(match)
-    return [
-        Candidate(
-            doc_length=doc_length,
-            subject_id=subject_id,
-            freq=len(matches) / doc_length,
-            is_pref=mean((float(m.is_pref) for m in matches)),
-            n_tokens=mean((m.n_tokens for m in matches)),
-            ambiguity=mean((m.ambiguity for m in matches)),
-            first_occ=matches[0].pos / doc_length,
-            last_occ=matches[-1].pos / doc_length,
-            spread=(matches[-1].pos - matches[0].pos) / doc_length,
-        )
-        for subject_id, matches in subj_matches.items()
-    ]
+
+    subject_ids = np.zeros(len(subj_matches), dtype=np.int32)
+    # float64 so that the feature values are bit-identical to the previous
+    # per-candidate namedtuples (the tfidf feature is computed from the freq
+    # value in float64 before the final float32 rounding)
+    feats = np.zeros((len(subj_matches), len(MatchFeature)), dtype=np.float64)
+    for idx, (subject_id, subj_ms) in enumerate(subj_matches.items()):
+        subject_ids[idx] = subject_id
+        feats[idx, MatchFeature.freq] = len(subj_ms) / doc_length
+        feats[idx, MatchFeature.is_pref] = mean((float(m.is_pref) for m in subj_ms))
+        feats[idx, MatchFeature.n_tokens] = mean(m.n_tokens for m in subj_ms)
+        feats[idx, MatchFeature.ambiguity] = mean(m.ambiguity for m in subj_ms)
+        feats[idx, MatchFeature.first_occ] = subj_ms[0].pos / doc_length
+        feats[idx, MatchFeature.last_occ] = subj_ms[-1].pos / doc_length
+        feats[idx, MatchFeature.spread] = (
+            subj_ms[-1].pos - subj_ms[0].pos
+        ) / doc_length
+        feats[idx, MatchFeature.doc_length] = doc_length
+    return CandidateBlock(subject_ids, feats)
 
 
 def generate_candidates(
@@ -83,7 +97,7 @@ def generate_candidates(
     analyzer: Analyzer,
     vectorizer: CountVectorizer,
     index: TokenSetIndex,
-) -> list[Candidate]:
+) -> CandidateBlock:
     sentences = analyzer.tokenize_sentences(text)
     sent_tokens = vectorizer.transform(sentences)
     matches = []
@@ -105,31 +119,34 @@ def generate_candidates(
 
 
 def candidates_to_features(
-    candidates: list[Candidate], mdata: "ModelData"
+    candidates: CandidateBlock, mdata: "ModelData"
 ) -> np.ndarray:
-    """Convert a list of Candidates to a NumPy feature matrix"""
+    """Convert a CandidateBlock to a NumPy feature matrix"""
 
-    matrix = np.zeros((len(candidates), len(Feature)), dtype=np.float32)
-    c_ids = [c.subject_id for c in candidates]
+    subject_ids = candidates.subject_ids
+    matrix = np.zeros((len(subject_ids), len(Feature)), dtype=np.float32)
+    c_ids = subject_ids.tolist()
     c_vec = np.zeros(mdata.related.shape[0], dtype=bool)
     c_vec[c_ids] = True
     broader = mdata.broader.multiply(c_vec).sum(axis=1)
     narrower = mdata.narrower.multiply(c_vec).sum(axis=1)
     related = mdata.related.multiply(c_vec).sum(axis=1)
     collection = mdata.collection.multiply(c_vec).T.dot(mdata.collection).sum(axis=0)
-    for idx, c in enumerate(candidates):
-        subj = c.subject_id
-        matrix[idx, Feature.freq] = c.freq
+    for idx, c in enumerate(candidates.feats):
+        subj = c_ids[idx]
+        matrix[idx, Feature.freq] = c[MatchFeature.freq]
         matrix[idx, Feature.doc_freq] = mdata.doc_freq[subj]
         matrix[idx, Feature.subj_freq] = mdata.subj_freq.get(subj, 1) - 1
-        matrix[idx, Feature.tfidf] = c.freq * mdata.idf[subj]
-        matrix[idx, Feature.is_pref] = c.is_pref
-        matrix[idx, Feature.n_tokens] = c.n_tokens
-        matrix[idx, Feature.ambiguity] = c.ambiguity
-        matrix[idx, Feature.first_occ] = c.first_occ
-        matrix[idx, Feature.last_occ] = c.last_occ
-        matrix[idx, Feature.spread] = c.spread
-        matrix[idx, Feature.doc_length] = c.doc_length
+        matrix[idx, Feature.tfidf] = (
+            c[MatchFeature.freq] * mdata.idf[subj]
+        )
+        matrix[idx, Feature.is_pref] = c[MatchFeature.is_pref]
+        matrix[idx, Feature.n_tokens] = c[MatchFeature.n_tokens]
+        matrix[idx, Feature.ambiguity] = c[MatchFeature.ambiguity]
+        matrix[idx, Feature.first_occ] = c[MatchFeature.first_occ]
+        matrix[idx, Feature.last_occ] = c[MatchFeature.last_occ]
+        matrix[idx, Feature.spread] = c[MatchFeature.spread]
+        matrix[idx, Feature.doc_length] = c[MatchFeature.doc_length]
         matrix[idx, Feature.broader] = broader[subj, 0] / len(c_ids)
         matrix[idx, Feature.narrower] = narrower[subj, 0] / len(c_ids)
         matrix[idx, Feature.related] = related[subj, 0] / len(c_ids)
@@ -148,9 +165,11 @@ def create_classifier(params: dict[str, Any]) -> BaggingClassifier:
 
 
 def prediction_to_list(
-    scores: np.ndarray, candidates: list[Candidate]
+    scores: np.ndarray, subject_ids: np.ndarray
 ) -> list[tuple[np.float64, int]]:
-    subj_scores = [(score[1], c.subject_id) for score, c in zip(scores, candidates)]
+    subj_scores = [
+        (score[1], int(subj_id)) for score, subj_id in zip(scores, subject_ids)
+    ]
     return sorted(subj_scores, reverse=True)
 
 
@@ -170,7 +189,7 @@ class MLLMFeatureConverter(annif.parallel.BaseWorker):
 class MLLMModel:
     """Maui-like Lexical Matching model"""
 
-    def generate_candidates(self, text: str, analyzer: Analyzer) -> list[Candidate]:
+    def generate_candidates(self, text: str, analyzer: Analyzer) -> CandidateBlock:
         return generate_candidates(text, analyzer, self._vectorizer, self._index)
 
     @property
@@ -185,7 +204,7 @@ class MLLMModel:
             idf=self._idf,
         )
 
-    def _candidates_to_features(self, candidates: list[Candidate]) -> np.ndarray:
+    def _candidates_to_features(self, candidates: CandidateBlock) -> np.ndarray:
         return candidates_to_features(candidates, self._model_data)
 
     @staticmethod
@@ -260,13 +279,13 @@ class MLLMModel:
 
     def _prepare_train_data(
         self, corpus: DocumentCorpus, analyzer: Analyzer, n_jobs: int
-    ) -> tuple[list[list[Candidate]], list[bool]]:
+    ) -> tuple[list[CandidateBlock], np.ndarray]:
         # frequency of subjects (by id) in the generated candidates
         self._doc_freq = collections.Counter()
         # frequency of manually assigned subjects ("domain keyphraseness")
         self._subj_freq = collections.Counter()
         train_x = []
-        train_y = []
+        train_ys = []
 
         jobs, pool_class = annif.parallel.get_pool(n_jobs)
 
@@ -284,9 +303,15 @@ class MLLMModel:
                 MLLMCandidateGenerator.generate_candidates, params, 10
             ):
                 self._subj_freq.update(doc_subject_ids)
-                self._doc_freq.update([c.subject_id for c in candidates])
+                self._doc_freq.update(candidates.subject_ids.tolist())
                 train_x.append(candidates)
-                train_y += [(c.subject_id in doc_subject_ids) for c in candidates]
+                train_ys.append(
+                    np.isin(candidates.subject_ids, list(doc_subject_ids))
+                )
+
+        # concatenate the per-document boolean label arrays into one
+        # (n_total_candidates,) train_y vector
+        train_y = np.concatenate(train_ys) if train_ys else np.empty(0, dtype=bool)
 
         return (train_x, train_y)
 
@@ -300,7 +325,7 @@ class MLLMModel:
         return idf
 
     def _prepare_features(
-        self, train_x: list[list[Candidate]], n_jobs: int
+        self, train_x: list[CandidateBlock], n_jobs: int
     ) -> list[np.ndarray]:
         fc_args = {"mdata": self._model_data}
         jobs, pool_class = annif.parallel.get_pool(n_jobs)
@@ -334,12 +359,12 @@ class MLLMModel:
         # convert the train data into feature values
         features = self._prepare_features(train_x, n_jobs)
 
-        return (np.vstack(features), np.array(train_y))
+        return (np.vstack(features), train_y)
 
     def train(
         self,
-        train_x: np.ndarray | list[tuple[int, int]],
-        train_y: list[bool] | np.ndarray,
+        train_x: np.ndarray,
+        train_y: np.ndarray,
         params: dict[str, Any],
     ) -> None:
         # fit the model on the training corpus
@@ -354,12 +379,12 @@ class MLLMModel:
                 + "data matches your vocabulary."
             )
 
-    def predict(self, candidates: list[Candidate]) -> list[tuple[np.float64, int]]:
-        if not candidates:
+    def predict(self, candidates: CandidateBlock) -> list[tuple[np.float64, int]]:
+        if not len(candidates.subject_ids):
             return []
         features = self._candidates_to_features(candidates)
         scores = self._classifier.predict_proba(features)
-        return prediction_to_list(scores, candidates)
+        return prediction_to_list(scores, candidates.subject_ids)
 
     def save(self, filename: str) -> list[str]:
         return joblib.dump(self, filename)

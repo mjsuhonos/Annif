@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from annif.backend.hyperopt import HPRecommendation
     from annif.corpus import Document, DocumentCorpus
-    from annif.lexical.mllm import Candidate
+    from annif.lexical.mllm import CandidateBlock
     from annif.vocab import SubjectIndex
 
 
@@ -61,10 +61,10 @@ class MLLMHPObjective(hyperopt.HPObjective):
 
         batch = annif.eval.EvaluationBatch(args["subject_index"])
         for goldsubj, candidates in zip(args["gold_subjects"], args["candidates"]):
-            if candidates:
+            if len(candidates.subject_ids):
                 features = candidates_to_features(candidates, args["model_data"])
                 scores = model.predict_proba(features)
-                ranking = prediction_to_list(scores, candidates)
+                ranking = prediction_to_list(scores, candidates.subject_ids)
             else:
                 ranking = []
             results = prediction_to_result(ranking, params, args["subject_index"])
@@ -207,7 +207,7 @@ class MLLMBackend(hyperopt.AnnifHyperoptBackend):
         self.info("saving model")
         annif.util.atomic_save(self._model, self.datadir, self.MODEL_FILE)
 
-    def _generate_candidates(self, text: str) -> list[Candidate]:
+    def _generate_candidates(self, text: str) -> CandidateBlock:
         return self._model.generate_candidates(text, self.project.analyzer)
 
     def _suggest(self, doc: Document, params: dict[str, Any]) -> Iterator:
