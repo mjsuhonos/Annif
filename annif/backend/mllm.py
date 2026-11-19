@@ -59,16 +59,28 @@ class MLLMHPObjective(hyperopt.HPObjective):
         model = create_classifier(params)
         model.fit(args["train_x"], args["train_y"])
 
+        # score the candidates of all documents in a single predict_proba
+        # call, then split the probabilities per document
+        all_features = np.vstack(
+            [
+                candidates_to_features(candidates, args["model_data"])
+                for candidates in args["candidates"]
+            ]
+        )
+        proba = model.predict_proba(all_features)
+
         batch = annif.eval.EvaluationBatch(args["subject_index"])
+        start = 0
         for goldsubj, candidates in zip(args["gold_subjects"], args["candidates"]):
-            if len(candidates.subject_ids):
-                features = candidates_to_features(candidates, args["model_data"])
-                scores = model.predict_proba(features)
+            end = start + len(candidates.subject_ids)
+            if end > start:
+                scores = proba[start:end]
                 ranking = prediction_to_list(scores, candidates.subject_ids)
             else:
                 ranking = []
             results = prediction_to_result(ranking, params, args["subject_index"])
             batch.evaluate_many([results], [goldsubj])
+            start = end
         results = batch.results(metrics=[args["metric"]])
         return results[args["metric"]]
 
@@ -202,7 +214,7 @@ class MLLMBackend(hyperopt.AnnifHyperoptBackend):
             train_data = self._load_train_data()
 
         self.info("training model")
-        self._model.train(train_data[0], train_data[1], params)
+        self._model.train(train_data[0], train_data[1], params, n_jobs=jobs or None)
 
         self.info("saving model")
         annif.util.atomic_save(self._model, self.datadir, self.MODEL_FILE)

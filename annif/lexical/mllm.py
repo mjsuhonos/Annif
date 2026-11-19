@@ -161,13 +161,16 @@ def candidates_to_features(
     return matrix
 
 
-def create_classifier(params: dict[str, Any]) -> BaggingClassifier:
+def create_classifier(
+    params: dict[str, Any], n_jobs: int | None = None
+) -> BaggingClassifier:
     return BaggingClassifier(
         DecisionTreeClassifier(
             min_samples_leaf=int(params["min_samples_leaf"]),
             max_leaf_nodes=int(params["max_leaf_nodes"]),
         ),
         max_samples=float(params["max_samples"]),
+        n_jobs=n_jobs,
     )
 
 
@@ -380,9 +383,10 @@ class MLLMModel:
         train_x: np.ndarray,
         train_y: np.ndarray,
         params: dict[str, Any],
+        n_jobs: int | None = None,
     ) -> None:
         # fit the model on the training corpus
-        self._classifier = create_classifier(params)
+        self._classifier = create_classifier(params, n_jobs=n_jobs)
         self._classifier.fit(train_x, train_y)
         # sanity check: verify that the classifier has seen both classes
         if self._classifier.n_classes_ != 2:
