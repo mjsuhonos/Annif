@@ -325,19 +325,22 @@ class MLLMModel:
         return idf
 
     def _prepare_features(
-        self, train_x: list[CandidateBlock], n_jobs: int
-    ) -> list[np.ndarray]:
+        self, train_x: list[CandidateBlock], features: np.ndarray, n_jobs: int
+    ) -> None:
+        """Fill the preallocated feature matrix, one document at a time"""
         fc_args = {"mdata": self._model_data}
         jobs, pool_class = annif.parallel.get_pool(n_jobs)
 
         with pool_class(
             jobs, initializer=MLLMFeatureConverter.init, initargs=(fc_args,)
         ) as pool:
-            features = pool.map(
+            start = 0
+            for block_features in pool.imap(
                 MLLMFeatureConverter.candidates_to_features, train_x, 10
-            )
-
-        return features
+            ):
+                end = start + len(block_features)
+                features[start:end] = block_features
+                start = end
 
     def prepare_train(
         self,
@@ -356,10 +359,14 @@ class MLLMModel:
         # precalculate idf values for all candidate subjects
         self._idf = self._calculate_idf(subject_ids, len(train_x))
 
-        # convert the train data into feature values
-        features = self._prepare_features(train_x, n_jobs)
+        # convert the train data into feature values; the total number of
+        # candidates is known from train_y, so the final feature matrix can
+        # be preallocated and filled in place (no list of per-document
+        # matrices, no final vstack copy)
+        features = np.zeros((len(train_y), len(Feature)), dtype=np.float32)
+        self._prepare_features(train_x, features, n_jobs)
 
-        return (np.vstack(features), train_y)
+        return (features, train_y)
 
     def train(
         self,
