@@ -2,13 +2,14 @@
 
 import multiprocessing.dummy
 
+import numpy as np
 import pytest
 
 import annif
 import annif.backend
 import annif.parallel
 from annif.backend.mllm import MLLMCandidateGenerator
-from annif.lexical.mllm import CandidateBlock
+from annif.lexical.mllm import CandidateBlock, Feature, candidates_to_features
 from annif.corpus import Document
 from annif.exception import NotInitializedException, NotSupportedException
 
@@ -126,6 +127,40 @@ def test_mllm_hyperopt(project, fulltext_corpus):
     optimizer.optimize(n_trials=3, n_jobs=1, results_file=None)
 
 
+def test_mllm_hyperopt_eval_corpus_differs_from_train(
+    project, fulltext_corpus, document_corpus
+):
+    """Regression test: the hyperopt corpus may differ from the corpus the
+    backend was trained with, so the objective must score candidates
+    generated from the hyperopt corpus (via the precomputed feature
+    matrix), not the cached training rows"""
+    mllm_type = annif.backend.get_backend("mllm")
+    mllm = mllm_type(
+        backend_id="mllm",
+        config_params={"limit": 10, "language": "fi"},
+        project=project,
+    )
+    mllm.train(fulltext_corpus)
+
+    optimizer = mllm.get_hp_optimizer(document_corpus, metric="NDCG")
+    args = optimizer._prepare(n_jobs=1)
+
+    # the feature matrix rows must match the eval corpus's candidates
+    n_candidates = sum(len(c.subject_ids) for c in args["candidates"])
+    assert args["features"].shape == (n_candidates, len(Feature))
+    # eval corpus differs from the training corpus (different docs)
+    assert args["features"].shape[0] != args["train_x"].shape[0]
+    # feature rows must be derived from the eval corpus's candidates
+    first = args["candidates"][0]
+    assert np.array_equal(
+        args["features"][: len(first.subject_ids)],
+        candidates_to_features(first, mllm._model._model_data),
+    )
+
+    result = optimizer.optimize(n_trials=2, n_jobs=1, results_file=None)
+    assert len(result.lines) == 3
+
+
 def test_mllm_candidate_generator_doc_batch(project, fulltext_corpus):
     """Test the worker method for generating candidates for a batch of
     documents, returning candidates and subject sets for each document"""
@@ -189,6 +224,10 @@ def test_mllm_hyperopt_parallel_n_jobs_2(project, fulltext_corpus, monkeypatch):
     assert len(parallel_args["candidates"]) == len(serial_args["candidates"])
     assert len(parallel_args["gold_subjects"]) == len(serial_args["gold_subjects"])
     assert paired_results(parallel_args) == paired_results(serial_args)
+    # the precomputed feature matrices must be identical, row for row;
+    # this also checks that parallel candidates arrive in corpus order
+    assert parallel_args["features"].shape == serial_args["features"].shape
+    assert np.array_equal(parallel_args["features"], serial_args["features"])
 
     result = optimizer.optimize(n_trials=3, n_jobs=2, results_file=None)
 

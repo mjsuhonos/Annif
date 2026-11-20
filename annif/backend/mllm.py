@@ -13,6 +13,7 @@ import annif.parallel
 import annif.util
 from annif.exception import NotInitializedException, NotSupportedException
 from annif.lexical.mllm import (
+    Feature,
     MLLMModel,
     create_classifier,
     prediction_to_list,
@@ -59,17 +60,19 @@ class MLLMHPObjective(hyperopt.HPObjective):
         model.fit(args["train_x"], args["train_y"])
 
         # score the candidates of all documents in a single predict_proba
-        # call; the rows of train_x are the feature values of the candidates
-        # in corpus document order, so they can be split per document by
-        # candidate counts
-        proba = model.predict_proba(args["train_x"])
+        # call, then split the probabilities per document; the rows of the
+        # precomputed eval feature matrix are in corpus document order
+        proba = model.predict_proba(args["features"])
 
         batch = annif.eval.EvaluationBatch(args["subject_index"])
         start = 0
         for goldsubj, candidates in zip(args["gold_subjects"], args["candidates"]):
             end = start + len(candidates.subject_ids)
-            scores = proba[start:end]
-            ranking = prediction_to_list(scores, candidates.subject_ids)
+            if end > start:
+                scores = proba[start:end]
+                ranking = prediction_to_list(scores, candidates.subject_ids)
+            else:
+                ranking = []
             results = prediction_to_result(ranking, params, args["subject_index"])
             batch.evaluate_many([results], [goldsubj])
             start = end
@@ -110,7 +113,8 @@ class MLLMOptimizer(hyperopt.HyperparameterOptimizer):
                 initargs=({"backend": self._backend},),
             ) as pool:
                 # ordered map: the candidate blocks must arrive in corpus
-                # order so that their rows match the train_x feature matrix
+                # order so that they stay aligned with the gold subjects and
+                # the rows of the precomputed eval feature matrix
                 for candidates, subject_sets in pool.imap(
                     MLLMCandidateGenerator.generate_for_doc_batch,
                     self._corpus.doc_batches,
@@ -118,13 +122,25 @@ class MLLMOptimizer(hyperopt.HyperparameterOptimizer):
                     all_candidates.extend(candidates)
                     gold_subjects.extend(subject_sets)
 
+        # convert the candidates of the hyperopt corpus to feature values
+        # once, so that every trial can score the eval corpus without
+        # recomputing the features
+        features = np.zeros(
+            (
+                sum(len(c.subject_ids) for c in all_candidates),
+                len(Feature),
+            ),
+            dtype=np.float32,
+        )
+        self._backend._model._prepare_features(all_candidates, features, n_jobs)
+
         return {
             "train_x": train_x,
             "train_y": train_y,
             "subject_index": self._backend.project.subjects,
             "gold_subjects": gold_subjects,
             "candidates": all_candidates,
-            "model_data": self._backend._model._model_data,
+            "features": features,
             "metric": self._metric,
         }
 
