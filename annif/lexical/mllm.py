@@ -174,15 +174,6 @@ def create_classifier(
     )
 
 
-def prediction_to_list(
-    scores: np.ndarray, subject_ids: np.ndarray
-) -> list[tuple[np.float64, int]]:
-    subj_scores = [
-        (score[1], int(subj_id)) for score, subj_id in zip(scores, subject_ids)
-    ]
-    return sorted(subj_scores, reverse=True)
-
-
 class MLLMCandidateGenerator(annif.parallel.BaseWorker):
     @classmethod
     def generate_candidates(cls, doc_subject_set, text):
@@ -397,12 +388,14 @@ class MLLMModel:
                 + "data matches your vocabulary."
             )
 
-    def predict(self, candidates: CandidateBlock) -> list[tuple[np.float64, int]]:
+    def predict(self, candidates: CandidateBlock) -> np.ndarray:
+        """Return the positive-class membership scores of the candidates,
+        aligned with candidates.subject_ids"""
         if not len(candidates.subject_ids):
-            return []
+            return np.empty(0, dtype=np.float64)
         features = self._candidates_to_features(candidates)
         scores = self._classifier.predict_proba(features)
-        return prediction_to_list(scores, candidates.subject_ids)
+        return scores[:, 1]
 
     def save(self, filename: str) -> list[str]:
         return joblib.dump(self, filename)

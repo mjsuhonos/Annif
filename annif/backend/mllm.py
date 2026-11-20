@@ -15,8 +15,8 @@ from annif.exception import NotInitializedException, NotSupportedException
 from annif.lexical.mllm import (
     Feature,
     MLLMModel,
+    candidates_to_features,
     create_classifier,
-    prediction_to_list,
 )
 from annif.suggestion import vector_to_suggestions
 
@@ -35,13 +35,13 @@ if TYPE_CHECKING:
 
 
 def prediction_to_result(
-    prediction: list[tuple[np.float64, int]],
+    scores: np.ndarray,
+    subject_ids: np.ndarray,
     params: dict[str, Any],
     subject_index: SubjectIndex,
 ) -> Iterator:
     vector = np.zeros(len(subject_index), dtype=np.float32)
-    for score, subject_id in prediction:
-        vector[subject_id] = score
+    vector[subject_ids] = scores
     return vector_to_suggestions(vector, int(params["limit"]))
 
 
@@ -66,14 +66,11 @@ class MLLMHPObjective(hyperopt.HPObjective):
 
         batch = annif.eval.EvaluationBatch(args["subject_index"])
         start = 0
-        for goldsubj, candidates in zip(args["gold_subjects"], args["candidates"]):
-            end = start + len(candidates.subject_ids)
-            if end > start:
-                scores = proba[start:end]
-                ranking = prediction_to_list(scores, candidates.subject_ids)
-            else:
-                ranking = []
-            results = prediction_to_result(ranking, params, args["subject_index"])
+        for goldsubj, subject_ids in zip(args["gold_subjects"], args["candidates"]):
+            end = start + len(subject_ids)
+            results = prediction_to_result(
+                proba[start:end, 1], subject_ids, params, args["subject_index"]
+            )
             batch.evaluate_many([results], [goldsubj])
             start = end
         results = batch.results(metrics=[args["metric"]])
@@ -81,15 +78,26 @@ class MLLMHPObjective(hyperopt.HPObjective):
 
 
 class MLLMCandidateGenerator(annif.parallel.BaseWorker):
-    """Worker class for generating candidates in parallel"""
+    """Worker class for generating candidates and converting them to
+    feature values in parallel"""
 
     @classmethod
-    def generate_for_doc_batch(cls, doc_batch) -> tuple[list, list]:
-        """Generate candidates for a batch of documents"""
+    def generate_and_convert_for_doc_batch(cls, doc_batch):
+        """Generate candidates for a batch of documents and convert them
+        to feature values. Returns a tuple of the concatenated feature
+        matrix for the batch, the per-document candidate subject id
+        arrays and the per-document gold subject sets."""
         backend = cls.args["backend"]
-        candidates = [backend._generate_candidates(doc.text) for doc in doc_batch]
-        subject_sets = [doc.subject_set for doc in doc_batch]
-        return (candidates, subject_sets)
+        mdata = cls.args["mdata"]
+        doc_features = []
+        subject_ids_list = []
+        subject_sets = []
+        for doc in doc_batch:
+            candidates = backend._generate_candidates(doc.text)
+            doc_features.append(candidates_to_features(candidates, mdata))
+            subject_ids_list.append(candidates.subject_ids)
+            subject_sets.append(doc.subject_set)
+        return (np.concatenate(doc_features), subject_ids_list, subject_sets)
 
 
 class MLLMOptimizer(hyperopt.HyperparameterOptimizer):
@@ -98,48 +106,51 @@ class MLLMOptimizer(hyperopt.HyperparameterOptimizer):
     def _prepare(self, n_jobs: int = 1) -> dict[str, Any]:
         self._backend.initialize()
         train_x, train_y = self._backend._load_train_data()
-        all_candidates = []
+        mdata = self._backend._model._model_data
+        all_subject_ids = []
         gold_subjects = []
+        feature_chunks = []
 
         if n_jobs == 1:
             for doc in self._corpus.documents:
-                all_candidates.append(self._backend._generate_candidates(doc.text))
+                candidates = self._backend._generate_candidates(doc.text)
+                feature_chunks.append(candidates_to_features(candidates, mdata))
+                all_subject_ids.append(candidates.subject_ids)
                 gold_subjects.append(doc.subject_set)
         else:
             n_jobs, pool_constructor = annif.parallel.get_pool(n_jobs)
             with pool_constructor(
                 n_jobs,
                 initializer=MLLMCandidateGenerator.init,
-                initargs=({"backend": self._backend},),
+                initargs=({"backend": self._backend, "mdata": mdata},),
             ) as pool:
-                # ordered map: the candidate blocks must arrive in corpus
-                # order so that they stay aligned with the gold subjects and
-                # the rows of the precomputed eval feature matrix
-                for candidates, subject_sets in pool.imap(
-                    MLLMCandidateGenerator.generate_for_doc_batch,
+                # ordered map: results must arrive in corpus order so that
+                # the subject ids, gold subjects and feature rows align
+                for features, subject_ids_list, subject_sets in pool.imap(
+                    MLLMCandidateGenerator.generate_and_convert_for_doc_batch,
                     self._corpus.doc_batches,
                 ):
-                    all_candidates.extend(candidates)
+                    feature_chunks.append(features)
+                    all_subject_ids.extend(subject_ids_list)
                     gold_subjects.extend(subject_sets)
 
-        # convert the candidates of the hyperopt corpus to feature values
-        # once, so that every trial can score the eval corpus without
-        # recomputing the features
-        features = np.zeros(
-            (
-                sum(len(c.subject_ids) for c in all_candidates),
-                len(Feature),
-            ),
-            dtype=np.float32,
-        )
-        self._backend._model._prepare_features(all_candidates, features, n_jobs)
+        # assemble the eval feature matrix in one preallocated array; rows
+        # are in corpus document order and match the subject id arrays
+        n_candidates = sum(len(subject_ids) for subject_ids in all_subject_ids)
+        features = np.zeros((n_candidates, len(Feature)), dtype=np.float32)
+        start = 0
+        for chunk_idx, chunk in enumerate(feature_chunks):
+            end = start + len(chunk)
+            features[start:end] = chunk
+            feature_chunks[chunk_idx] = None
+            start = end
 
         return {
             "train_x": train_x,
             "train_y": train_y,
             "subject_index": self._backend.project.subjects,
             "gold_subjects": gold_subjects,
-            "candidates": all_candidates,
+            "candidates": all_subject_ids,
             "features": features,
             "metric": self._metric,
         }
@@ -234,5 +245,7 @@ class MLLMBackend(hyperopt.AnnifHyperoptBackend):
 
     def _suggest(self, doc: Document, params: dict[str, Any]) -> Iterator:
         candidates = self._generate_candidates(doc.text)
-        prediction = self._model.predict(candidates)
-        return prediction_to_result(prediction, params, self.project.subjects)
+        scores = self._model.predict(candidates)
+        return prediction_to_result(
+            scores, candidates.subject_ids, params, self.project.subjects
+        )

@@ -9,7 +9,7 @@ import annif
 import annif.backend
 import annif.parallel
 from annif.backend.mllm import MLLMCandidateGenerator
-from annif.lexical.mllm import CandidateBlock, Feature, candidates_to_features
+from annif.lexical.mllm import Feature, candidates_to_features
 from annif.corpus import Document
 from annif.exception import NotInitializedException, NotSupportedException
 
@@ -146,15 +146,16 @@ def test_mllm_hyperopt_eval_corpus_differs_from_train(
     args = optimizer._prepare(n_jobs=1)
 
     # the feature matrix rows must match the eval corpus's candidates
-    n_candidates = sum(len(c.subject_ids) for c in args["candidates"])
+    n_candidates = sum(len(subject_ids) for subject_ids in args["candidates"])
     assert args["features"].shape == (n_candidates, len(Feature))
     # eval corpus differs from the training corpus (different docs)
     assert args["features"].shape[0] != args["train_x"].shape[0]
     # feature rows must be derived from the eval corpus's candidates
-    first = args["candidates"][0]
+    first = list(document_corpus.documents)[0]
+    first_block = mllm._generate_candidates(first.text)
     assert np.array_equal(
-        args["features"][: len(first.subject_ids)],
-        candidates_to_features(first, mllm._model._model_data),
+        args["features"][: len(first_block.subject_ids)],
+        candidates_to_features(first_block, mllm._model._model_data),
     )
 
     result = optimizer.optimize(n_trials=2, n_jobs=1, results_file=None)
@@ -162,8 +163,9 @@ def test_mllm_hyperopt_eval_corpus_differs_from_train(
 
 
 def test_mllm_candidate_generator_doc_batch(project, fulltext_corpus):
-    """Test the worker method for generating candidates for a batch of
-    documents, returning candidates and subject sets for each document"""
+    """Test the worker method for generating candidates and converting
+    them to feature values for a batch of documents, returning the batch
+    feature matrix, subject id arrays and subject sets"""
     mllm_type = annif.backend.get_backend("mllm")
     mllm = mllm_type(
         backend_id="mllm",
@@ -171,23 +173,24 @@ def test_mllm_candidate_generator_doc_batch(project, fulltext_corpus):
         project=project,
     )
     mllm.initialize()
-    MLLMCandidateGenerator.init({"backend": mllm})
+    MLLMCandidateGenerator.init(
+        {"backend": mllm, "mdata": mllm._model._model_data}
+    )
 
     doc_batch = list(fulltext_corpus.documents)[:4]
-    candidates, subject_sets = MLLMCandidateGenerator.generate_for_doc_batch(doc_batch)
+    features, subject_ids_list, subject_sets = (
+        MLLMCandidateGenerator.generate_and_convert_for_doc_batch(doc_batch)
+    )
 
-    assert len(candidates) == len(doc_batch)
+    assert len(subject_ids_list) == len(doc_batch)
     assert len(subject_sets) == len(doc_batch)
     assert subject_sets == [doc.subject_set for doc in doc_batch]
-    assert all(
-        isinstance(doc_candidates, CandidateBlock)
-        for doc_candidates in candidates
+    assert features.shape == (
+        sum(len(subject_ids) for subject_ids in subject_ids_list),
+        len(Feature),
     )
-    assert all(
-        len(candidates_.subject_ids) == len(candidates_.feats)
-        for candidates_ in candidates
-    )
-    assert any(candidates)
+    assert features.dtype == np.float32
+    assert features.shape[0] > 0
 
 
 def test_mllm_hyperopt_parallel_n_jobs_2(project, fulltext_corpus, monkeypatch):
@@ -208,12 +211,9 @@ def test_mllm_hyperopt_parallel_n_jobs_2(project, fulltext_corpus, monkeypatch):
     serial_args = optimizer._prepare(n_jobs=1)
     parallel_args = optimizer._prepare(n_jobs=2)
 
-    def cand_key(candidates):
-        """hashable representation of a candidate block for comparison"""
-        return (
-            tuple(candidates.subject_ids.tolist()),
-            tuple(candidates.feats.ravel().tolist()),
-        )
+    def cand_key(subject_ids):
+        """hashable representation of a candidate subject id array"""
+        return tuple(subject_ids.tolist())
 
     def paired_results(args):
         return sorted(
